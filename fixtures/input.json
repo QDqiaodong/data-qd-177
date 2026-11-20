@@ -1,0 +1,34 @@
+{
+  "kerf_mm": 3,
+  "min_offcut_mm": 100,
+  "stock": [
+    {
+      "id": "S1",
+      "material": "oak",
+      "length_mm": 1200,
+      "trim_head_mm": 10,
+      "trim_tail_mm": 10
+    },
+    {
+      "id": "S2",
+      "material": "oak",
+      "length_mm": 900,
+      "trim_head_mm": 10,
+      "trim_tail_mm": 10
+    }
+  ],
+  "orders": [
+    {
+      "id": "chair",
+      "material": "oak",
+      "piece_mm": 400,
+      "quantity": 4
+    },
+    {
+      "id": "shelf",
+      "material": "oak",
+      "piece_mm": 200,
+      "quantity": 1
+    }
+  ]
+}
