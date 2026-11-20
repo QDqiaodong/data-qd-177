@@ -1,0 +1,13 @@
+{
+  "job_id": "batch-2",
+  "kerf_mm": 3,
+  "min_offcut_mm": 100,
+  "orders": [
+    {
+      "id": "slat",
+      "material": "oak",
+      "piece_mm": 160,
+      "quantity": 1
+    }
+  ]
+}

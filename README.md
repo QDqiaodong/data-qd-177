@@ -28,6 +28,29 @@ uv pip check --python .venv/bin/python
 
 输入或业务规则无效、输出已存在时退出2，保留原目标；成功退出0。报告/数据库先完整生成再原子新建，无覆盖。run/为忽略目录。
 
+## 跨批次库存工作区
+
+`stock-workspace` 在单批命令之上提供跨批次余料库存：可回收余料在提交时入库，后续批次可直接使用。单批 `cut-ticket` 行为不变。
+
+```sh
+.venv/bin/stock-workspace init --source fixtures/stock.json --workspace run/ws
+.venv/bin/stock-workspace plan --workspace run/ws --source fixtures/batch1.json --output run/plan1.json
+.venv/bin/stock-workspace commit --workspace run/ws --plan run/plan1.json --output run/result1.json
+.venv/bin/stock-workspace plan --workspace run/ws --source fixtures/batch2.json --output run/plan2.json
+.venv/bin/stock-workspace commit --workspace run/ws --plan run/plan2.json --output run/result2.json
+.venv/bin/stock-workspace status --workspace run/ws
+.venv/bin/stock-workspace status --workspace run/ws --job batch-1
+```
+
+预期：batch-1 消耗2根原材并入库一段171mm橡木余料；batch-2 只用该余料切出160mm板条，库存修订版升到2。
+
+- `init` 从初始原材清单（沿用 `stock` 行契约）建立工作区，目标路径必须不存在。
+- `plan` 在当前库存修订版上生成预览计划，不改变库存；计划记录所依据的修订版与完整请求身份。批次输入沿用 `orders`、`kerf_mm`、`min_offcut_mm` 规则，另需非空稳定的 `job_id`。
+- `commit` 仅当计划的修订版仍是当前版本才生效：消耗实际分配到切割票的库存条目，同批可回收余料同时入库。过期计划、篡改版计划、跨工作区计划退出2，库存不变。
+- `job_id` 是幂等身份：相同请求与计划重试返回原结果且不重复扣料；同一 `job_id` 携带不同请求、计划或来源修订版退出2。
+- `status` 查询当前库存（含已消耗条目及其消费工单），`--job` 查询已提交批次结果。
+- 工作区状态单文件原子替换，提交经文件锁串行化：进程中途崩溃不产生半次扣料或半份余料，并发提交同一修订版至多一个成功。所有失败退出2并保留已有工作区、提交记录和输出文件。
+
 ## 契约与边界
 
 详见[数据契约](docs/contract.md)。采用确定性best-fit decreasing可行启发式，不保证最优。缺件是有效业务结果，见summary.complete及unfilled。

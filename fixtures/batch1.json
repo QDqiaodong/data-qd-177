@@ -1,0 +1,19 @@
+{
+  "job_id": "batch-1",
+  "kerf_mm": 3,
+  "min_offcut_mm": 100,
+  "orders": [
+    {
+      "id": "chair",
+      "material": "oak",
+      "piece_mm": 400,
+      "quantity": 4
+    },
+    {
+      "id": "shelf",
+      "material": "oak",
+      "piece_mm": 200,
+      "quantity": 1
+    }
+  ]
+}

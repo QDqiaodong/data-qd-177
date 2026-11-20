@@ -10,6 +10,7 @@ dependencies = []
 
 [project.scripts]
 cut-ticket = "sawmill.cli:main"
+stock-workspace = "sawmill.inventory_cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
