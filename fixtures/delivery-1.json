@@ -1,0 +1,76 @@
+{
+  "dispatch_id": "DSP-2026-01",
+  "candidate_pieces": [
+    {
+      "job_id": "batch-1",
+      "entry_id": "stock/S1",
+      "order_id": "chair",
+      "unit": 3
+    },
+    {
+      "job_id": "batch-1",
+      "entry_id": "stock/S1",
+      "order_id": "chair",
+      "unit": 4
+    },
+    {
+      "job_id": "batch-1",
+      "entry_id": "stock/S1",
+      "order_id": "shelf",
+      "unit": 1
+    },
+    {
+      "job_id": "batch-1",
+      "entry_id": "stock/S2",
+      "order_id": "chair",
+      "unit": 1
+    },
+    {
+      "job_id": "batch-1",
+      "entry_id": "stock/S2",
+      "order_id": "chair",
+      "unit": 2
+    },
+    {
+      "job_id": "batch-2",
+      "entry_id": "offcut/batch-1/stock/S1",
+      "order_id": "slat",
+      "unit": 1
+    }
+  ],
+  "kits": [
+    {
+      "kit_id": "KIT-A",
+      "priority": 0,
+      "slots": [
+        {
+          "slot_id": "back",
+          "material": "oak",
+          "min_mm": 390,
+          "max_mm": 410,
+          "grain_group": "G"
+        },
+        {
+          "slot_id": "seat",
+          "material": "oak",
+          "min_mm": 390,
+          "max_mm": 410,
+          "grain_group": "G"
+        }
+      ]
+    },
+    {
+      "kit_id": "KIT-B",
+      "priority": 1,
+      "slots": [
+        {
+          "slot_id": "panel",
+          "material": "oak",
+          "min_mm": 150,
+          "max_mm": 210,
+          "grain_group": "H"
+        }
+      ]
+    }
+  ]
+}

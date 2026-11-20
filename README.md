@@ -96,6 +96,28 @@ uv pip check --python .venv/bin/python
 - `cost` 按当前库存修订版与各根最新价格输出明细：成品以 `(job_id, entry_id, order_id, unit)` 标识，损耗以工单、来源条目、类别与半开坐标标识，存量以 `entry_id` 标识；含每票输入成本、逐段分摊与按根/材种/整体的守恒汇总。改价会传递到已消耗余料的后代成品与损耗。
 - `close run` 输入非空 `close_id`、`previous_close_id`（首轮为 null，此后必须是最近一次成功关账）与两个期待修订版。成功时冻结截点、各根价格、完整明细与桥接表；之后的切割、质量事件、改价都不改变已冻结结果。桥接分两步可分别核对：上一轮截点用本轮价格重算减去上轮冻结明细得历史价差，本轮截点减去该重算得本轮生产转移；每行及汇总满足 期初＋价差＋转移＝期末，每根生产转移合计为0。相同 `close_id` 相同输入重试返回原冻结结果；同 id 不同输入、上一轮身份或期待版本过期退出2，不能覆盖或分叉关账链。关账在提交锁内取一致截点，状态原子持久化，中断后按原输入重试补出同一结果，不重复记账。
 
+### 成品配套交付与质量召回
+
+`delivery` 在已提交切割票的真实成品之上做整套配货、出库与召回定位。预览不产生任何库存或出库副作用；提交在同一原子更新中冻结交付清单、登记 `dispatch_id` 并占用所选成品。
+
+```sh
+.venv/bin/stock-workspace delivery plan --workspace run/ws --source fixtures/delivery-1.json --output run/dplan.json
+.venv/bin/stock-workspace delivery commit --workspace run/ws --plan run/dplan.json --output run/dresult.json
+.venv/bin/stock-workspace delivery status --workspace run/ws
+.venv/bin/stock-workspace incident register --workspace run/ws --source fixtures/incident.json --output run/incident.json
+.venv/bin/stock-workspace delivery status --workspace run/ws --dispatch DSP-2026-01
+.venv/bin/stock-workspace delivery affected --workspace run/ws --incident QC-2026-111
+```
+
+预期：KIT-A 的两个同纹槽位配上同根 S1 的 chair#3/#4，KIT-B 配上余料切出的 slat#1（总余量30mm最小），成品修订版升到3；对 S1 登记质量事件后，`delivery status --dispatch DSP-2026-01` 把 KIT-A、KIT-B 都标记为召回并只列出真正来自 S1 的实物，`delivery affected --incident QC-2026-111` 从事件一侧定位到 DSP-2026-01。
+
+- 预览输入：非空 `dispatch_id`、1至32个互不重复的候选实物引用 `(job_id, entry_id, order_id, unit)`（`unit` 为正严格整数，其余为非空字符串）、1至8个套件。套件含唯一 `kit_id`、非负严格整数 `priority`（越小越优先）与1至4个槽位（全请求不超过24个）；槽位含套内唯一 `slot_id`、`material`、正严格整数 `min_mm`/`max_mm`（前者不大于后者）与 `grain_group`。字段错误、布尔冒充整数、规模越界均退出2；输入数组重排不改变语义与最终方案。
+- 只认已提交切割票中的真实成品（材种、长度 `end_mm-start_mm`、根原材均取自原始事实）；未提交切件、缺件、余料与损耗不能充数，同名件号在不同工单或条目上是不同实物。未知或重复引用退出2；已出库或根被活动事件覆盖的已知件列入排除清单（分别给出占用交付身份与活动事件），不参与配货。
+- 每槽用一件同材且长度落在闭区间的成品，不截短、不拼接、不重复；同套同 `grain_group` 的槽位必须同根（多代余料按根判断），组名跨套互不关联；套件只整套选中或不配。配货求全局唯一最优：先比完整套件数，再比按 `(priority, kit_id)` 排列的交付0/1向量，再比总余量 `成品长度-min_mm`，最后比逐槽实物引用序列（`unit` 按整数比较）；不是逐套贪心。允许配成0套。
+- 预览输出含工作区身份、完整规范化请求、依据的成品修订版、选中套逐槽实物/根/长度、未选套、排除件及原因、剩余候选，以及可独立核对四层比较的指标。提交时重核工作区、成品修订版与完整方案：手改配货、约束遗漏、非规范最优、版本过期均退出2；成功即冻结清单、登记 `dispatch_id`、占用成品并推进成品修订版（0套同样登记并推进一次）。同 `dispatch_id` 同请求同计划重试优先返回原冻结结果；换请求、换方案或换来源版本冲突。输出原子新建，冲突先判不写状态；中断后按原计划恢复，不重复出库。
+- 成品修订版独立于库存/成本修订版：新切割提交、质量事件首次登记或解除、新交付提交各推进一次（幂等重放不推进）；事件即使不改变可用库存也推进；价格登记与关账不推进。交付不推进库存或成本修订版、不改动切割票与成本明细、不使切割计划过期。
+- `delivery status` 列出全部成品的归属与 `available`/`isolated`/`delivered` 状态及活动事件——已交付与质量覆盖是两个维度，召回不把实物放回待配池。`delivery status --dispatch` 返回原冻结清单并另列当前受影响套件：任一槽位根被活动事件覆盖则整套召回，只列真正来自被覆盖根的实物。`delivery affected --incident` 按根与真实交付事实定位全部历史交付（活动或已解除事件均可），并显示事件是否仍活动；未知事件或交付退出2。
+
 ## 契约与边界
 
 详见[数据契约](docs/contract.md)。采用确定性best-fit decreasing可行启发式，不保证最优。缺件是有效业务结果，见summary.complete及unfilled。

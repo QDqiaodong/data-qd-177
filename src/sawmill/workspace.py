@@ -24,14 +24,14 @@ import os
 import shutil
 import tempfile
 from contextlib import contextmanager
-from hashlib import sha256
 from pathlib import Path
 
-from .io import load, publish, integer, text
+from .io import load, publish, integer, text, canonical, fingerprint
 from .layout import compile_tickets
 from .model import (validate_stock_rows, validate_batch, validate_incident,
                     validate_price, validate_close)
 from . import costing
+from . import delivery
 
 SCHEMA = 1
 STATE_NAME = "state.json"
@@ -47,12 +47,11 @@ class ConflictError(ValueError):
 
 
 def _canonical(value):
-    return json.dumps(value, ensure_ascii=False, sort_keys=True,
-                      separators=(",", ":"), allow_nan=False)
+    return canonical(value)
 
 
 def _fingerprint(value):
-    return sha256(_canonical(value).encode("utf-8")).hexdigest()
+    return fingerprint(value)
 
 
 def _request_identity(data):
@@ -115,9 +114,11 @@ def _initial_state(stock):
         "workspace_id": _fingerprint(
             {"initial_entries": [entries[key] for key in sorted(entries)]}),
         "revision": 0,
+        "finished_revision": 0,
         "entries": entries,
         "jobs": {},
         "incidents": {},
+        "dispatches": {},
     }
 
 
@@ -135,6 +136,10 @@ def _read_state(workspace_dir):
     state.setdefault("price_log", [])
     state.setdefault("closes", {})
     state.setdefault("close_order", [])
+    # Older workspaces predate finished-goods delivery; their finished-goods
+    # revision starts at 0 and piece facts are recovered from committed jobs.
+    state.setdefault("finished_revision", 0)
+    state.setdefault("dispatches", {})
     return state
 
 
@@ -283,6 +288,8 @@ def _apply_or_replay(state, plan):
     for entry in plan["added_entries"]:
         state["entries"][entry["entry_id"]] = dict(entry)
     state["revision"] = revision
+    # New committed pieces are new finished-goods facts.
+    state["finished_revision"] += 1
     result = {
         "schema_version": SCHEMA,
         "kind": "stock-workspace-commit",
@@ -489,6 +496,9 @@ def register_incident(workspace_dir, source_path, output_path=None):
         after = _usable_entry_ids(state)
         if after != before:
             state["revision"] += 1
+        # Every new incident is a finished-goods fact change even when no
+        # inventory entry changes hands: already-cut pieces may be isolated.
+        state["finished_revision"] += 1
         incident["registered_revision"] = state["revision"]
         result = _incident_report(state, incident)
         incident["report"] = result
@@ -518,6 +528,8 @@ def release_incident(workspace_dir, incident_id, output_path=None):
         changed = after != before
         if changed:
             state["revision"] += 1
+        # A first release changes the finished-goods facts as well.
+        state["finished_revision"] += 1
         incident["released_revision"] = state["revision"]
         result = {
             "schema_version": SCHEMA,
@@ -814,6 +826,272 @@ def close_status(workspace_dir, close_id=None):
                  "inventory_revision": record["result"]["inventory_revision"],
                  "price_revision": record["result"]["price_revision"]}
                 for record in (state["closes"][key] for key in state["close_order"])],
+        }
+
+
+# ---------------------------------------------------------------------------
+# Finished-goods delivery
+#
+# Delivery works on real committed cut pieces, never on inventory entries:
+# the piece catalog is re-derived from committed tickets on every read, so
+# old workspaces need no migration. A dedicated ``finished_revision`` counts
+# every change to the finished-goods facts -- each new cutting commit, each
+# incident's first registration or first release, and each new delivery
+# commit -- and delivery previews pin it exactly the way cutting plans pin
+# the inventory revision. Delivery commits never touch the inventory or
+# price revisions, committed tickets, or cost detail, so cutting plans and
+# closes are unaffected by dispatching.
+# ---------------------------------------------------------------------------
+
+
+def _finished_catalog(state):
+    """Every real committed piece: reference tuple -> material/length/root."""
+    catalog = {}
+    for job_id in sorted(state["jobs"]):
+        job = state["jobs"][job_id]
+        for ticket in job["result"]["tickets"]:
+            entry_id = ticket["stock_id"]
+            root = state["entries"][entry_id]["root_stock_id"]
+            for cut in ticket["cuts"]:
+                catalog[(job_id, entry_id, cut["order_id"], cut["unit"])] = {
+                    "job_id": job_id, "entry_id": entry_id,
+                    "order_id": cut["order_id"], "unit": cut["unit"],
+                    "material": ticket["material"],
+                    "length_mm": cut["end_mm"] - cut["start_mm"],
+                    "root_stock_id": root,
+                }
+    return catalog
+
+
+def _delivered_map(state):
+    """Piece reference tuple -> dispatch id that occupies it, from all commits."""
+    occupied = {}
+    for dispatch_id in sorted(state["dispatches"]):
+        result = state["dispatches"][dispatch_id]["result"]
+        for kit in result["selected_kits"]:
+            for slot in kit["slots"]:
+                piece = slot["piece"]
+                occupied[(piece["job_id"], piece["entry_id"],
+                          piece["order_id"], piece["unit"])] = dispatch_id
+    return occupied
+
+
+def _delivery_view(state):
+    return {"workspace_id": state["workspace_id"],
+            "finished_revision": state["finished_revision"],
+            "catalog": _finished_catalog(state),
+            "delivered_by": _delivered_map(state),
+            "covered_roots": _active_root_incidents(state)}
+
+
+def delivery_plan(workspace_dir, source_path, output_path):
+    """Pure preview pinned to the current finished revision; mutates nothing."""
+    data = load(source_path)
+    with _locked(workspace_dir, exclusive=False):
+        result = delivery.build_plan(data=data, **_delivery_view(_read_state(workspace_dir)))
+    publish(output_path, result)
+    return result
+
+
+def _validate_delivery_plan_shape(plan):
+    if plan.get("kind") != "stock-workspace-delivery-plan" \
+            or plan.get("schema_version") != SCHEMA:
+        raise ValueError("not a supported stock-workspace delivery plan")
+    for key in ("workspace_id", "base_finished_revision", "dispatch_id",
+                "request", "request_sha256", "selected_kits",
+                "unselected_kit_ids", "excluded_pieces", "remaining_pieces",
+                "metrics"):
+        if key not in plan:
+            raise ValueError(f"plan is missing {key}")
+    integer(plan["base_finished_revision"], "base_finished_revision")
+    text(plan["dispatch_id"], "dispatch_id")
+    if plan["request_sha256"] != _fingerprint(plan["request"]):
+        raise ValueError("plan request does not match its recorded hash")
+
+
+def _apply_delivery(state, plan):
+    """Validate the delivery plan against live state and mutate in memory.
+
+    Returns (result, replayed). Callers persist state only when not replayed.
+    """
+    _validate_delivery_plan_shape(plan)
+    if plan["workspace_id"] != state["workspace_id"]:
+        raise ValueError("plan belongs to a different workspace")
+    dispatch_id = plan["dispatch_id"]
+    existing = state["dispatches"].get(dispatch_id)
+    if existing is not None:
+        if (existing["plan_sha256"] == _fingerprint(plan)
+                and existing["request_sha256"] == plan["request_sha256"]):
+            return existing["result"], True
+        raise ConflictError(
+            f"dispatch_id is already committed with a different request or plan: "
+            f"{dispatch_id}")
+    if plan["base_finished_revision"] != state["finished_revision"]:
+        raise StalePlanError(
+            f"plan is stale: based on finished revision "
+            f"{plan['base_finished_revision']}, workspace is at finished "
+            f"revision {state['finished_revision']}")
+    rebuilt = delivery.build_plan(data=plan["request"], **_delivery_view(state))
+    if rebuilt != plan:
+        raise ValueError("plan content does not match the current workspace state")
+    finished_revision = state["finished_revision"] + 1
+    result = {
+        "schema_version": SCHEMA,
+        "kind": "stock-workspace-delivery",
+        "workspace_id": state["workspace_id"],
+        "dispatch_id": dispatch_id,
+        "base_finished_revision": plan["base_finished_revision"],
+        "finished_revision": finished_revision,
+        "request": plan["request"],
+        "request_sha256": plan["request_sha256"],
+        "selected_kits": plan["selected_kits"],
+        "unselected_kit_ids": plan["unselected_kit_ids"],
+        "excluded_pieces": plan["excluded_pieces"],
+        "remaining_pieces": plan["remaining_pieces"],
+        "metrics": plan["metrics"],
+    }
+    state["dispatches"][dispatch_id] = {
+        "dispatch_id": dispatch_id,
+        "request_sha256": plan["request_sha256"],
+        "plan_sha256": _fingerprint(plan),
+        "base_finished_revision": plan["base_finished_revision"],
+        "finished_revision": finished_revision,
+        "result": result,
+    }
+    state["finished_revision"] = finished_revision
+    return result, False
+
+
+def delivery_commit(workspace_dir, plan_path, output_path):
+    plan_data = load(plan_path)
+    with _locked(workspace_dir):
+        state = _read_state(workspace_dir)
+        result, replayed = _apply_delivery(state, plan_data)
+        # A conflicting output is detected before any state change.
+        needs_publish = _output_ready(output_path, result)
+        if not replayed:
+            _write_state(workspace_dir, state)
+    # Canonical key order keeps a fresh commit byte-identical to replays.
+    result = json.loads(_canonical(result))
+    if needs_publish:
+        publish(output_path, result)
+    return result
+
+
+def delivery_status(workspace_dir, dispatch_id=None):
+    with _locked(workspace_dir, exclusive=False):
+        state = _read_state(workspace_dir)
+        covered = _active_root_incidents(state)
+        if dispatch_id is not None:
+            record = state["dispatches"].get(dispatch_id)
+            if record is None:
+                raise ValueError(f"unknown dispatch_id: {dispatch_id}")
+            result = record["result"]
+            kits = []
+            for kit in result["selected_kits"]:
+                affected = []
+                kit_incidents = set()
+                for slot in kit["slots"]:
+                    piece = slot["piece"]
+                    incidents = list(covered.get(piece["root_stock_id"], ()))
+                    if incidents:
+                        affected.append({
+                            "job_id": piece["job_id"],
+                            "entry_id": piece["entry_id"],
+                            "order_id": piece["order_id"],
+                            "unit": piece["unit"],
+                            "root_stock_id": piece["root_stock_id"],
+                            "active_incidents": incidents})
+                        kit_incidents.update(incidents)
+                kits.append({"kit_id": kit["kit_id"],
+                             "recall": bool(affected),
+                             "active_incidents": sorted(kit_incidents),
+                             "affected_pieces": affected})
+            return {
+                "schema_version": SCHEMA,
+                "kind": "stock-workspace-delivery-detail",
+                "workspace_id": state["workspace_id"],
+                "finished_revision": state["finished_revision"],
+                "dispatch_id": dispatch_id,
+                "result": result,
+                "recall": {
+                    "active_incidents": sorted(
+                        key for key, other in state["incidents"].items()
+                        if other["status"] == "active"),
+                    "kits": kits,
+                },
+            }
+        catalog = _finished_catalog(state)
+        delivered_by = _delivered_map(state)
+        pieces = []
+        for ref in sorted(catalog):
+            facts = catalog[ref]
+            incidents = list(covered.get(facts["root_stock_id"], ()))
+            owner = delivered_by.get(ref)
+            if owner is not None:
+                status = "delivered"
+            elif incidents:
+                status = "isolated"
+            else:
+                status = "available"
+            pieces.append({**facts, "status": status, "delivered_by": owner,
+                           "active_incidents": incidents})
+        dispatches = [
+            {"dispatch_id": key,
+             "finished_revision": record["finished_revision"],
+             "selected_kits": len(record["result"]["selected_kits"]),
+             "delivered_pieces": sum(len(kit["slots"])
+                                     for kit in record["result"]["selected_kits"])}
+            for key, record in sorted(state["dispatches"].items())]
+        return {
+            "schema_version": SCHEMA,
+            "kind": "stock-workspace-delivery-status",
+            "workspace_id": state["workspace_id"],
+            "finished_revision": state["finished_revision"],
+            "pieces": pieces,
+            "dispatches": dispatches,
+            "summary": {
+                "pieces": len(pieces),
+                "available": sum(1 for p in pieces if p["status"] == "available"),
+                "isolated": sum(1 for p in pieces if p["status"] == "isolated"),
+                "delivered": sum(1 for p in pieces if p["status"] == "delivered"),
+            },
+        }
+
+
+def delivery_affected(workspace_dir, incident_id):
+    """All deliveries with pieces under an incident's roots, active or not.
+
+    Location is computed from the incident's roots and the real committed
+    delivery facts, so deliveries made before the incident was registered --
+    or after it was released -- are found exactly the same way.
+    """
+    text(incident_id, "incident_id")
+    with _locked(workspace_dir, exclusive=False):
+        state = _read_state(workspace_dir)
+        incident = state["incidents"].get(incident_id)
+        if incident is None:
+            raise ValueError(f"unknown incident_id: {incident_id}")
+        roots = set(incident["roots"])
+        deliveries = []
+        for dispatch_id in sorted(state["dispatches"]):
+            result = state["dispatches"][dispatch_id]["result"]
+            kits = []
+            for kit in result["selected_kits"]:
+                pieces = [slot["piece"] for slot in kit["slots"]
+                          if slot["piece"]["root_stock_id"] in roots]
+                if pieces:
+                    kits.append({"kit_id": kit["kit_id"], "pieces": pieces})
+            if kits:
+                deliveries.append({"dispatch_id": dispatch_id, "kits": kits})
+        return {
+            "schema_version": SCHEMA,
+            "kind": "stock-workspace-delivery-affected",
+            "workspace_id": state["workspace_id"],
+            "incident_id": incident["incident_id"],
+            "status": incident["status"],
+            "roots": list(incident["roots"]),
+            "deliveries": deliveries,
         }
 
 

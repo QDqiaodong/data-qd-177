@@ -2,6 +2,7 @@
 import json
 import os
 import tempfile
+from hashlib import sha256
 from pathlib import Path
 
 
@@ -45,6 +46,17 @@ def integer(value, label, minimum=0):
     if type(value) is not int or value < minimum:
         raise ValueError(f"{label} must be an integer >= {minimum}")
     return value
+
+
+def canonical(value):
+    """Deterministic JSON encoding: sorted keys, tight separators, no NaN."""
+    return json.dumps(value, ensure_ascii=False, sort_keys=True,
+                      separators=(",", ":"), allow_nan=False)
+
+
+def fingerprint(value):
+    """Stable content hash of a JSON-able value under its canonical encoding."""
+    return sha256(canonical(value).encode("utf-8")).hexdigest()
 
 
 def text(value, label):

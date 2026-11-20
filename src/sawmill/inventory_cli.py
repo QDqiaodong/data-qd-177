@@ -69,6 +69,27 @@ def main():
     close_status_p.add_argument("--workspace", required=True)
     close_status_p.add_argument("--close", default=None)
 
+    delivery_p = sub.add_parser("delivery", help="成品配套交付与质量召回定位")
+    delivery_sub = delivery_p.add_subparsers(dest="delivery_command", required=True)
+
+    dplan_p = delivery_sub.add_parser("plan", help="基于当前成品修订版预览整套配货")
+    dplan_p.add_argument("--workspace", required=True)
+    dplan_p.add_argument("--source", required=True)
+    dplan_p.add_argument("--output", required=True)
+
+    dcommit_p = delivery_sub.add_parser("commit", help="提交交付计划，出库所选成品")
+    dcommit_p.add_argument("--workspace", required=True)
+    dcommit_p.add_argument("--plan", required=True)
+    dcommit_p.add_argument("--output", required=True)
+
+    dstatus_p = delivery_sub.add_parser("status", help="查询成品归属与交付召回状态")
+    dstatus_p.add_argument("--workspace", required=True)
+    dstatus_p.add_argument("--dispatch", default=None)
+
+    daffected_p = delivery_sub.add_parser("affected", help="按质量事件定位历史交付")
+    daffected_p.add_argument("--workspace", required=True)
+    daffected_p.add_argument("--incident", required=True)
+
     args = parser.parse_args()
     try:
         if args.command == "init":
@@ -99,6 +120,15 @@ def main():
                 result = workspace.close_run(args.workspace, args.source, args.output)
             else:
                 result = workspace.close_status(args.workspace, args.close)
+        elif args.command == "delivery":
+            if args.delivery_command == "plan":
+                result = workspace.delivery_plan(args.workspace, args.source, args.output)
+            elif args.delivery_command == "commit":
+                result = workspace.delivery_commit(args.workspace, args.plan, args.output)
+            elif args.delivery_command == "status":
+                result = workspace.delivery_status(args.workspace, args.dispatch)
+            else:
+                result = workspace.delivery_affected(args.workspace, args.incident)
         else:
             result = workspace.status(args.workspace, args.job)
     except (OSError, ValueError, KeyError, TypeError, OverflowError) as exc:
