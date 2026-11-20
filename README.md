@@ -69,6 +69,33 @@ uv pip check --python .venv/bin/python
 - 首次登记或解除使可用库存变化时推进库存修订版，使此前生成的旧计划因过期而无法提交。事件永远不会把已消耗条目恢复为可用。
 - 同一事件重放返回原结果；同 id 不同原材集合、已解除事件重新激活、未知原材、空/重复集合、非法输入、已存在且内容不同的输出均退出2，并保留此前状态。
 
+### 成本登记、当前成本与连续关账
+
+每根初始原材的采购成本独立登记、整根替换；成本沿切割来源链逐层按毫米整数分摊，关账把两个修订版截点、当时价格、完整成本明细与桥接表一并冻结。
+
+```sh
+.venv/bin/stock-workspace init --source fixtures/stock.json --workspace run/ws-cost
+.venv/bin/stock-workspace price register --workspace run/ws-cost --source fixtures/price-s1.json --output run/price-s1.json
+.venv/bin/stock-workspace price register --workspace run/ws-cost --source fixtures/price-s2.json --output run/price-s2.json
+.venv/bin/stock-workspace plan --workspace run/ws-cost --source fixtures/batch1.json --output run/cplan1.json
+.venv/bin/stock-workspace commit --workspace run/ws-cost --plan run/cplan1.json --output run/cresult1.json
+.venv/bin/stock-workspace plan --workspace run/ws-cost --source fixtures/batch2.json --output run/cplan2.json
+.venv/bin/stock-workspace commit --workspace run/ws-cost --plan run/cplan2.json --output run/cresult2.json
+.venv/bin/stock-workspace cost --workspace run/ws-cost
+.venv/bin/stock-workspace close run --workspace run/ws-cost --source fixtures/close-1.json --output run/close-1.json
+.venv/bin/stock-workspace price register --workspace run/ws-cost --source fixtures/price-s1-correction.json --output run/price-s1-correction.json
+.venv/bin/stock-workspace close run --workspace run/ws-cost --source fixtures/close-2.json --output run/close-2.json
+.venv/bin/stock-workspace close status --workspace run/ws-cost --close CLOSE-2026-01
+.venv/bin/stock-workspace price status --workspace run/ws-cost
+```
+
+预期：`cost` 显示两根各自守恒（S1 120000分＝成品116000＋损耗4000，S2 90000分＝成品80000＋损耗10000，全工作区210000分）；首轮关账 CLOSE-2026-01 历史价差全为0；S1 更正为118800分后，CLOSE-2026-02 的 S1 历史价差合计 −1200、生产转移合计 0（如 chair 每件 40000→39600 归历史价差）；`close status --close CLOSE-2026-01` 仍返回首轮冻结结果。
+
+- `price register` 输入非空 `price_id`、初始原材 `stock_id`、非负严格整数 `amount_cents`（整根全部采购成本，含以后修掉的头尾）与非负严格整数 `expected_price_revision`。每次新登记把该根总成本替换为新金额，成本修订版（从0起）推进一次；期待版本必须等于当前成本版本。相同 `price_id` 相同完整输入重试返回原结果（优先于版本检查）；同 id 不同输入、未知根、非法金额退出2。登记不推进库存修订版，也不使已有计划过期。零价合法；有根缺价时 `cost` 与 `close run` 列出缺价根并退出2，不以0估价。
+- 成本沿来源链逐层传递：每张已提交切割票把所消耗条目的整数成本按物理长度分给头修边、每件成品、每道锯缝、余料与尾修边（忽略零长度段），先取整数下限再按精确余数从大到小各补1分（余数相同则物理起点小者优先，全程整数运算）。可回收余料携带分得成本进入下一代重新分摊；不可回收余料、修边与锯缝归入损耗。任意截点每根满足：成品＋损耗＋未消耗库存＝该根当时价格。已消耗条目不再计价；被隔离未消耗条目仍持有库存成本。
+- `cost` 按当前库存修订版与各根最新价格输出明细：成品以 `(job_id, entry_id, order_id, unit)` 标识，损耗以工单、来源条目、类别与半开坐标标识，存量以 `entry_id` 标识；含每票输入成本、逐段分摊与按根/材种/整体的守恒汇总。改价会传递到已消耗余料的后代成品与损耗。
+- `close run` 输入非空 `close_id`、`previous_close_id`（首轮为 null，此后必须是最近一次成功关账）与两个期待修订版。成功时冻结截点、各根价格、完整明细与桥接表；之后的切割、质量事件、改价都不改变已冻结结果。桥接分两步可分别核对：上一轮截点用本轮价格重算减去上轮冻结明细得历史价差，本轮截点减去该重算得本轮生产转移；每行及汇总满足 期初＋价差＋转移＝期末，每根生产转移合计为0。相同 `close_id` 相同输入重试返回原冻结结果；同 id 不同输入、上一轮身份或期待版本过期退出2，不能覆盖或分叉关账链。关账在提交锁内取一致截点，状态原子持久化，中断后按原输入重试补出同一结果，不重复记账。
+
 ## 契约与边界
 
 详见[数据契约](docs/contract.md)。采用确定性best-fit decreasing可行启发式，不保证最优。缺件是有效业务结果，见summary.complete及unfilled。

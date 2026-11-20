@@ -43,6 +43,32 @@ def main():
     query_p.add_argument("--workspace", required=True)
     query_p.add_argument("--incident", default=None)
 
+    price_p = sub.add_parser("price", help="成本登记与价格查询")
+    price_sub = price_p.add_subparsers(dest="price_command", required=True)
+
+    price_register_p = price_sub.add_parser("register", help="登记或更正一根原材的采购成本")
+    price_register_p.add_argument("--workspace", required=True)
+    price_register_p.add_argument("--source", required=True)
+    price_register_p.add_argument("--output", required=True)
+
+    price_status_p = price_sub.add_parser("status", help="查询当前价格与成本修订版")
+    price_status_p.add_argument("--workspace", required=True)
+
+    cost_p = sub.add_parser("cost", help="按当前修订版与最新价格查询完整成本明细")
+    cost_p.add_argument("--workspace", required=True)
+
+    close_p = sub.add_parser("close", help="连续关账与关账查询")
+    close_sub = close_p.add_subparsers(dest="close_command", required=True)
+
+    close_run_p = close_sub.add_parser("run", help="在当前一致截点执行一次关账")
+    close_run_p.add_argument("--workspace", required=True)
+    close_run_p.add_argument("--source", required=True)
+    close_run_p.add_argument("--output", required=True)
+
+    close_status_p = close_sub.add_parser("status", help="查询已冻结的关账结果")
+    close_status_p.add_argument("--workspace", required=True)
+    close_status_p.add_argument("--close", default=None)
+
     args = parser.parse_args()
     try:
         if args.command == "init":
@@ -60,6 +86,19 @@ def main():
                     args.workspace, args.incident, args.output)
             else:
                 result = workspace.incident_status(args.workspace, args.incident)
+        elif args.command == "price":
+            if args.price_command == "register":
+                result = workspace.register_price(
+                    args.workspace, args.source, args.output)
+            else:
+                result = workspace.price_status(args.workspace)
+        elif args.command == "cost":
+            result = workspace.cost_query(args.workspace)
+        elif args.command == "close":
+            if args.close_command == "run":
+                result = workspace.close_run(args.workspace, args.source, args.output)
+            else:
+                result = workspace.close_status(args.workspace, args.close)
         else:
             result = workspace.status(args.workspace, args.job)
     except (OSError, ValueError, KeyError, TypeError, OverflowError) as exc:

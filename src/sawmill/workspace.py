@@ -11,6 +11,12 @@ either fully visible or fully absent and a retry is always safe. Committed
 Quality incidents isolate the stock roots they name. Isolation is not stored on
 the entries: it is derived on every read from the active incident set, so a
 consumed identity can never be revived by registering or releasing an event.
+
+Root purchase costs are registered under a separate price revision that never
+invalidates cutting plans. Cost detail is derived from committed tickets and
+the price log on every read, and closes freeze consistent
+(inventory revision, price revision) snapshots with their bridges, so frozen
+closes stay stable no matter what happens afterwards.
 """
 import fcntl
 import json
@@ -23,7 +29,9 @@ from pathlib import Path
 
 from .io import load, publish, integer, text
 from .layout import compile_tickets
-from .model import validate_stock_rows, validate_batch, validate_incident
+from .model import (validate_stock_rows, validate_batch, validate_incident,
+                    validate_price, validate_close)
+from . import costing
 
 SCHEMA = 1
 STATE_NAME = "state.json"
@@ -122,6 +130,11 @@ def _read_state(workspace_dir):
         raise ValueError(f"unsupported workspace state: {path}")
     # Older schema-1 workspaces predate quality events; they have no incidents.
     state.setdefault("incidents", {})
+    # Older workspaces predate cost tracking; they have no prices or closes.
+    state.setdefault("price_revision", 0)
+    state.setdefault("price_log", [])
+    state.setdefault("closes", {})
+    state.setdefault("close_order", [])
     return state
 
 
@@ -585,6 +598,222 @@ def incident_status(workspace_dir, incident_id=None):
                      and entry["root_stock_id"] in incident["roots"]
                      and covered.get(entry["root_stock_id"])]}
                 for _, incident in sorted(state["incidents"].items())],
+        }
+
+
+# ---------------------------------------------------------------------------
+# Cost registration, current cost detail, and sequential closing
+#
+# Every root's purchase cost is registered independently and replaced (never
+# added to) by each new registration; the workspace keeps its own price
+# revision, advanced only by successful new registrations. Cost flows along
+# the source chain at read time, so a price correction revalues every
+# descendant piece and loss without touching committed history. Closes freeze
+# a consistent (inventory revision, price revision) snapshot plus the bridge
+# from the previous close; the frozen record is persisted in the same atomic
+# state write, so an interrupted close is replayed, never double-booked.
+# ---------------------------------------------------------------------------
+
+
+def _root_stock_ids(state):
+    return sorted(entry["root_stock_id"] for entry in state["entries"].values()
+                  if entry["kind"] == "stock")
+
+
+def _prices_at(state, price_revision):
+    """Root prices adopted at a price revision, replayed from the price log."""
+    prices = {}
+    for record in state["price_log"]:
+        if record["price_revision"] <= price_revision:
+            prices[record["stock_id"]] = record["amount_cents"]
+    return prices
+
+
+def _require_full_prices(state, prices):
+    missing = [root for root in _root_stock_ids(state) if root not in prices]
+    if missing:
+        raise ValueError(
+            "missing registered prices for stock roots: " + ", ".join(missing))
+
+
+def _detail_at(state, revision, price_revision):
+    """Full cost detail at one consistent (inventory, price) snapshot."""
+    prices = _prices_at(state, price_revision)
+    _require_full_prices(state, prices)
+    detail = costing.build_cost_detail(state, revision, prices)
+    detail["revision"] = revision
+    detail["price_revision"] = price_revision
+    detail["prices"] = {root: prices[root] for root in sorted(prices)}
+    return detail
+
+
+def register_price(workspace_dir, source_path, output_path=None):
+    data = load(source_path)
+    price_id, stock_id, amount, expected = validate_price(data)
+    request = {"price_id": price_id, "stock_id": stock_id, "amount_cents": amount,
+               "expected_price_revision": expected}
+    with _locked(workspace_dir):
+        state = _read_state(workspace_dir)
+        _require_known_roots(state, [stock_id])
+        for record in state["price_log"]:
+            if record["price_id"] != price_id:
+                continue
+            if record["request"] == request:
+                # Identical retry: the original result, even if the expected
+                # revision recorded in it is long past.
+                result = record["result"]
+                if output_path is not None and _output_ready(output_path, result):
+                    publish(output_path, result)
+                return result
+            raise ConflictError(
+                f"price_id is already registered with different input: {price_id}")
+        if expected != state["price_revision"]:
+            raise ValueError(
+                f"expected_price_revision is stale: expected {expected}, "
+                f"workspace is at price revision {state['price_revision']}")
+        previous_amount = _prices_at(state, state["price_revision"]).get(stock_id)
+        revision = state["price_revision"] + 1
+        result = {
+            "schema_version": SCHEMA,
+            "kind": "stock-workspace-price",
+            "workspace_id": state["workspace_id"],
+            "price_id": price_id,
+            "stock_id": stock_id,
+            "amount_cents": amount,
+            "previous_amount_cents": previous_amount,
+            "price_revision": revision,
+        }
+        result = json.loads(_canonical(result))
+        needs_publish = output_path is not None and _output_ready(output_path, result)
+        state["price_log"].append({
+            "price_id": price_id, "stock_id": stock_id, "amount_cents": amount,
+            "price_revision": revision, "request": request, "result": result})
+        state["price_revision"] = revision
+        _write_state(workspace_dir, state)
+    if needs_publish:
+        publish(output_path, result)
+    return result
+
+
+def price_status(workspace_dir):
+    with _locked(workspace_dir, exclusive=False):
+        state = _read_state(workspace_dir)
+        prices = _prices_at(state, state["price_revision"])
+        return {
+            "schema_version": SCHEMA,
+            "kind": "stock-workspace-price-status",
+            "workspace_id": state["workspace_id"],
+            "price_revision": state["price_revision"],
+            "prices": {root: prices[root] for root in sorted(prices)},
+            "missing_stock_ids": [root for root in _root_stock_ids(state)
+                                  if root not in prices],
+            "registrations": [
+                {"price_id": record["price_id"], "stock_id": record["stock_id"],
+                 "amount_cents": record["amount_cents"],
+                 "price_revision": record["price_revision"]}
+                for record in state["price_log"]],
+        }
+
+
+def cost_query(workspace_dir):
+    """Current cost detail: current inventory revision, latest root prices."""
+    with _locked(workspace_dir, exclusive=False):
+        state = _read_state(workspace_dir)
+        detail = _detail_at(state, state["revision"], state["price_revision"])
+        result = {"schema_version": SCHEMA, "kind": "stock-workspace-cost",
+                  "workspace_id": state["workspace_id"], **detail}
+        return json.loads(_canonical(result))
+
+
+def close_run(workspace_dir, source_path, output_path=None):
+    data = load(source_path)
+    close_id, previous_id, expected_inventory, expected_price = validate_close(data)
+    request = {"close_id": close_id, "previous_close_id": previous_id,
+               "expected_inventory_revision": expected_inventory,
+               "expected_price_revision": expected_price}
+    with _locked(workspace_dir):
+        state = _read_state(workspace_dir)
+        existing = state["closes"].get(close_id)
+        if existing is not None:
+            if existing["request"] == request:
+                # Identical retry: the frozen result, even if its expected
+                # revisions are stale or newer closes already exist.
+                result = existing["result"]
+                if output_path is not None and _output_ready(output_path, result):
+                    publish(output_path, result)
+                return result
+            raise ConflictError(
+                f"close_id is already recorded with different input: {close_id}")
+        latest = state["close_order"][-1] if state["close_order"] else None
+        if previous_id != latest:
+            raise ConflictError(
+                f"previous_close_id does not continue the close chain: "
+                f"expected {latest!r}, got {previous_id!r}")
+        if expected_inventory != state["revision"]:
+            raise ValueError(
+                f"expected_inventory_revision is stale: expected {expected_inventory}, "
+                f"workspace is at revision {state['revision']}")
+        if expected_price != state["price_revision"]:
+            raise ValueError(
+                f"expected_price_revision is stale: expected {expected_price}, "
+                f"workspace is at price revision {state['price_revision']}")
+        prices = _prices_at(state, state["price_revision"])
+        _require_full_prices(state, prices)
+        detail_current = _detail_at(state, state["revision"], state["price_revision"])
+        if latest is None:
+            # First close: the opening projection is revision 0 (all initial
+            # stock in inventory) under this round's prices, so the historical
+            # price change is zero everywhere by construction.
+            detail_opening = _detail_at(state, 0, state["price_revision"])
+            previous_revision = 0
+        else:
+            previous_result = state["closes"][latest]["result"]
+            detail_opening = previous_result["detail"]
+            previous_revision = previous_result["inventory_revision"]
+        detail_repriced = _detail_at(state, previous_revision, state["price_revision"])
+        bridge = costing.build_bridge(detail_opening, detail_repriced,
+                                      detail_current, latest)
+        result = {
+            "schema_version": SCHEMA,
+            "kind": "stock-workspace-close",
+            "workspace_id": state["workspace_id"],
+            "close_id": close_id,
+            "previous_close_id": previous_id,
+            "inventory_revision": state["revision"],
+            "price_revision": state["price_revision"],
+            "prices": {root: prices[root] for root in sorted(prices)},
+            "detail": detail_current,
+            "bridge": bridge,
+        }
+        result = json.loads(_canonical(result))
+        needs_publish = output_path is not None and _output_ready(output_path, result)
+        state["closes"][close_id] = {"close_id": close_id, "request": request,
+                                     "result": result}
+        state["close_order"].append(close_id)
+        _write_state(workspace_dir, state)
+    if needs_publish:
+        publish(output_path, result)
+    return result
+
+
+def close_status(workspace_dir, close_id=None):
+    with _locked(workspace_dir, exclusive=False):
+        state = _read_state(workspace_dir)
+        if close_id is not None:
+            record = state["closes"].get(close_id)
+            if record is None:
+                raise ValueError(f"unknown close_id: {close_id}")
+            return record["result"]
+        return {
+            "schema_version": SCHEMA,
+            "kind": "stock-workspace-close-list",
+            "workspace_id": state["workspace_id"],
+            "closes": [
+                {"close_id": record["result"]["close_id"],
+                 "previous_close_id": record["result"]["previous_close_id"],
+                 "inventory_revision": record["result"]["inventory_revision"],
+                 "price_revision": record["result"]["price_revision"]}
+                for record in (state["closes"][key] for key in state["close_order"])],
         }
 
 

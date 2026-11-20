@@ -1,0 +1,6 @@
+{
+  "close_id": "CLOSE-2026-02",
+  "previous_close_id": "CLOSE-2026-01",
+  "expected_inventory_revision": 2,
+  "expected_price_revision": 3
+}

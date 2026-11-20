@@ -34,6 +34,27 @@ def validate_batch(data):
     return job_id, orders
 
 
+def validate_price(data):
+    """Cost registration: stable id, one initial root, replacement total cost."""
+    price_id = text(data["price_id"], "price_id")
+    stock_id = text(data["stock_id"], "stock_id")
+    integer(data["amount_cents"], "amount_cents")
+    integer(data["expected_price_revision"], "expected_price_revision")
+    return price_id, stock_id, data["amount_cents"], data["expected_price_revision"]
+
+
+def validate_close(data):
+    """Close request: stable id, chain predecessor, and both expected revisions."""
+    close_id = text(data["close_id"], "close_id")
+    previous = data["previous_close_id"]
+    if previous is not None:
+        text(previous, "previous_close_id")
+    integer(data["expected_inventory_revision"], "expected_inventory_revision")
+    integer(data["expected_price_revision"], "expected_price_revision")
+    return (close_id, previous, data["expected_inventory_revision"],
+            data["expected_price_revision"])
+
+
 def validate_incident(data):
     """Quality incident registration: stable id plus one or more initial stock roots."""
     incident_id = text(data["incident_id"], "incident_id")
