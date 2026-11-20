@@ -34,6 +34,25 @@ def validate_batch(data):
     return job_id, orders
 
 
+def validate_incident(data):
+    """Quality incident registration: stable id plus one or more initial stock roots."""
+    incident_id = text(data["incident_id"], "incident_id")
+    roots = data["stock_ids"]
+    if not isinstance(roots, list):
+        raise ValueError("stock_ids must be an array")
+    if not roots:
+        raise ValueError("require at least one stock_id")
+    if len(roots) > 1000:
+        raise ValueError("require at most 1000 stock_ids")
+    seen = set()
+    for root in roots:
+        text(root, "stock_id")
+        if root in seen:
+            raise ValueError(f"duplicate stock_id: {root}")
+        seen.add(root)
+    return incident_id, sorted(seen)
+
+
 def validate(data):
     stock = unique(data["stock"], "stock")
     orders = unique(data["orders"], "order")

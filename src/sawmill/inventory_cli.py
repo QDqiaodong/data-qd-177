@@ -26,6 +26,23 @@ def main():
     status_p.add_argument("--workspace", required=True)
     status_p.add_argument("--job", default=None)
 
+    incident_p = sub.add_parser("incident", help="质量事件：登记、解除、查询")
+    incident_sub = incident_p.add_subparsers(dest="incident_command", required=True)
+
+    register_p = incident_sub.add_parser("register", help="登记质量事件并生成追溯报告")
+    register_p.add_argument("--workspace", required=True)
+    register_p.add_argument("--source", required=True)
+    register_p.add_argument("--output", required=True)
+
+    release_p = incident_sub.add_parser("release", help="解除指定质量事件")
+    release_p.add_argument("--workspace", required=True)
+    release_p.add_argument("--incident", required=True)
+    release_p.add_argument("--output", required=True)
+
+    query_p = incident_sub.add_parser("status", help="查询质量事件及其隔离影响")
+    query_p.add_argument("--workspace", required=True)
+    query_p.add_argument("--incident", default=None)
+
     args = parser.parse_args()
     try:
         if args.command == "init":
@@ -34,6 +51,15 @@ def main():
             result = workspace.plan(args.workspace, args.source, args.output)
         elif args.command == "commit":
             result = workspace.commit(args.workspace, args.plan, args.output)
+        elif args.command == "incident":
+            if args.incident_command == "register":
+                result = workspace.register_incident(
+                    args.workspace, args.source, args.output)
+            elif args.incident_command == "release":
+                result = workspace.release_incident(
+                    args.workspace, args.incident, args.output)
+            else:
+                result = workspace.incident_status(args.workspace, args.incident)
         else:
             result = workspace.status(args.workspace, args.job)
     except (OSError, ValueError, KeyError, TypeError, OverflowError) as exc:

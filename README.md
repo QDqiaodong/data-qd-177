@@ -51,6 +51,24 @@ uv pip check --python .venv/bin/python
 - `status` 查询当前库存（含已消耗条目及其消费工单），`--job` 查询已提交批次结果。
 - 工作区状态单文件原子替换，提交经文件锁串行化：进程中途崩溃不产生半次扣料或半份余料，并发提交同一修订版至多一个成功。所有失败退出2并保留已有工作区、提交记录和输出文件。
 
+### 质量事件追溯与隔离
+
+发现某批原材质量问题后，登记事件即可追溯其已进入哪些切割票，并隔离其剩余余料后代。
+
+```sh
+.venv/bin/stock-workspace incident register --workspace run/ws --source fixtures/incident.json --output run/incident.json
+.venv/bin/stock-workspace incident status --workspace run/ws
+.venv/bin/stock-workspace incident status --workspace run/ws --incident QC-2026-111
+.venv/bin/stock-workspace incident release --workspace run/ws --incident QC-2026-111 --output run/release.json
+```
+
+- 事件输入 `incident_id` 与一个或多个初始原材 `stock_id`（`stock_ids`，兼容单值 `stock_id`），覆盖这些根原材及其逐批产生的全部余料后代。
+- `register` 生成稳定报告：每个根下当前及历史全部库存条目，以及所有已提交切割票中由该根切出的成品件（批次、订单、件号、库存条目身份、切割坐标）。已提交切件与既有批次报告保持不变；事件只标记影响，不撤销切割或库存消耗。
+- `status` 区分 `available`、`consumed`、`isolated`（因活动质量事件暂不可用），并显示每个条目的 `active_incidents`。
+- 根原材仍有活动事件时，其全部可用余料后代不得进入新计划。`release` 只关闭指定事件，仍被其他事件覆盖的根继续隔离。
+- 首次登记或解除使可用库存变化时推进库存修订版，使此前生成的旧计划因过期而无法提交。事件永远不会把已消耗条目恢复为可用。
+- 同一事件重放返回原结果；同 id 不同原材集合、已解除事件重新激活、未知原材、空/重复集合、非法输入、已存在且内容不同的输出均退出2，并保留此前状态。
+
 ## 契约与边界
 
 详见[数据契约](docs/contract.md)。采用确定性best-fit decreasing可行启发式，不保证最优。缺件是有效业务结果，见summary.complete及unfilled。
