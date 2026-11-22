@@ -1,0 +1,22 @@
+{
+  "job_id": "salvage-1",
+  "kerf_mm": 3,
+  "min_offcut_mm": 100,
+  "candidate_entry_ids": [
+    "stock/S1"
+  ],
+  "orders": [
+    {
+      "id": "chair",
+      "material": "oak",
+      "piece_mm": 400,
+      "quantity": 1
+    },
+    {
+      "id": "rail",
+      "material": "oak",
+      "piece_mm": 240,
+      "quantity": 1
+    }
+  ]
+}

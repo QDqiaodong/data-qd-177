@@ -1,0 +1,15 @@
+{
+  "inspection_id": "INSP-2026-030",
+  "entry_id": "stock/S1",
+  "expected_inventory_revision": 0,
+  "reject_zones": [
+    {
+      "start_mm": 300,
+      "end_mm": 340
+    },
+    {
+      "start_mm": 760,
+      "end_mm": 775
+    }
+  ]
+}

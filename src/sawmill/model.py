@@ -74,6 +74,63 @@ def validate_incident(data):
     return incident_id, sorted(seen)
 
 
+def merge_reject_zones(zones):
+    """Union of half-open intervals; overlapping and touching intervals join.
+
+    Accepts ``(start_mm, end_mm)`` pairs in any order and returns merged
+    ``{"start_mm", "end_mm"}`` rows sorted by physical start.
+    """
+    ordered = sorted(zones)
+    merged = []
+    for start, end in ordered:
+        if merged and start <= merged[-1][1]:
+            if end > merged[-1][1]:
+                merged[-1] = (merged[-1][0], end)
+        else:
+            merged.append((start, end))
+    return [{"start_mm": start, "end_mm": end} for start, end in merged]
+
+
+def validate_inspection(data):
+    """Local inspection registration: stable id, one entry, revision, zones."""
+    inspection_id = text(data["inspection_id"], "inspection_id")
+    entry_id = text(data["entry_id"], "entry_id")
+    expected = integer(data["expected_inventory_revision"],
+                       "expected_inventory_revision")
+    raw_zones = data["reject_zones"]
+    if not isinstance(raw_zones, list):
+        raise ValueError("reject_zones must be an array")
+    if len(raw_zones) > 32:
+        raise ValueError("require at most 32 reject zones")
+    zones = []
+    for row in raw_zones:
+        if not isinstance(row, dict):
+            raise ValueError("reject_zones rows must be objects")
+        start = integer(row["start_mm"], "start_mm")
+        end = integer(row["end_mm"], "end_mm")
+        if start >= end:
+            raise ValueError("reject zone must satisfy start_mm < end_mm")
+        zones.append((start, end))
+    return inspection_id, entry_id, expected, zones
+
+
+def validate_salvage(data):
+    """Salvage request: batch fields plus a bounded candidate entry list."""
+    job_id, orders = validate_batch(data)
+    candidates = data["candidate_entry_ids"]
+    if not isinstance(candidates, list):
+        raise ValueError("candidate_entry_ids must be an array")
+    if not 1 <= len(candidates) <= 4:
+        raise ValueError("require 1..4 candidate_entry_ids")
+    seen = set()
+    for entry_id in candidates:
+        text(entry_id, "candidate_entry_ids")
+        if entry_id in seen:
+            raise ValueError(f"duplicate candidate_entry_ids: {entry_id}")
+        seen.add(entry_id)
+    return job_id, orders, sorted(seen)
+
+
 def validate(data):
     stock = unique(data["stock"], "stock")
     orders = unique(data["orders"], "order")

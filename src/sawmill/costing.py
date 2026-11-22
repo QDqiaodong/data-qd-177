@@ -18,7 +18,9 @@ root's adopted purchase price.
 """
 
 # Loss segment categories; a reusable offcut is inventory, not loss.
-LOSS_CATEGORIES = ("trim_head", "trim_tail", "kerf", "offcut_scrap")
+# ``defect_reject`` is the local reject zone removed only by salvage tickets.
+LOSS_CATEGORIES = ("trim_head", "trim_tail", "kerf", "offcut_scrap",
+                   "defect_reject")
 
 
 def allocate_cents(amount_cents, lengths):
@@ -39,6 +41,35 @@ def allocate_cents(amount_cents, lengths):
     return amounts
 
 
+def salvage_ticket_segments(ticket):
+    """Physical segments of a salvage ticket, taken from its full partition.
+
+    The partition already covers the parent entry's complete physical length
+    without gaps or overlaps, distinguishing trims, local reject zones,
+    pieces, kerfs, reusable offcuts and scrapped lane remainders. All lanes
+    of one parent are apportioned together in a single call, so the parent
+    cost is never split per lane and rounded a second time.
+    """
+    segments = []
+    for partition in ticket["partitions"]:
+        segment = {"kind": partition["kind"],
+                   "start_mm": partition["start_mm"],
+                   "end_mm": partition["end_mm"],
+                   "length_mm": partition["length_mm"]}
+        if partition["kind"] == "piece":
+            segment["order_id"] = partition["order_id"]
+            segment["unit"] = partition["unit"]
+        elif partition["kind"] == "offcut":
+            segment["reusable"] = partition["reusable"]
+            if partition["reusable"]:
+                segment["entry_id"] = partition["entry_id"]
+            else:
+                segment["scrap_category"] = partition.get(
+                    "scrap_category", "offcut_scrap")
+        segments.append(segment)
+    return segments
+
+
 def ticket_segments(ticket, entry):
     """Physical segments of a committed ticket over its consumed entry.
 
@@ -46,6 +77,8 @@ def ticket_segments(ticket, entry):
     Segments come back in physical-start order and their lengths sum to the
     entry's full length.
     """
+    if ticket.get("salvage"):
+        return salvage_ticket_segments(ticket)
     segments = []
 
     def add(kind, start_mm, end_mm, **extra):
@@ -120,7 +153,9 @@ def build_cost_detail(state, revision, prices):
                 elif segment["kind"] == "offcut":
                     row["reusable"] = segment["reusable"]
                     if segment["reusable"]:
-                        offcut_id = f"offcut/{job['job_id']}/{entry['entry_id']}"
+                        offcut_id = segment.get(
+                            "entry_id",
+                            f"offcut/{job['job_id']}/{entry['entry_id']}")
                         row["entry_id"] = offcut_id
                         offcut_costs[offcut_id] = amount
                     else:

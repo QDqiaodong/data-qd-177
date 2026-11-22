@@ -29,9 +29,11 @@ from pathlib import Path
 from .io import load, publish, integer, text, canonical, fingerprint
 from .layout import compile_tickets
 from .model import (validate_stock_rows, validate_batch, validate_incident,
-                    validate_price, validate_close)
+                    validate_price, validate_close, validate_inspection,
+                    validate_salvage, merge_reject_zones)
 from . import costing
 from . import delivery
+from . import salvage as salvage_mod
 
 SCHEMA = 1
 STATE_NAME = "state.json"
@@ -119,6 +121,8 @@ def _initial_state(stock):
         "jobs": {},
         "incidents": {},
         "dispatches": {},
+        "inspections": {},
+        "inspection_log": [],
     }
 
 
@@ -140,6 +144,10 @@ def _read_state(workspace_dir):
     # revision starts at 0 and piece facts are recovered from committed jobs.
     state.setdefault("finished_revision", 0)
     state.setdefault("dispatches", {})
+    # Older workspaces predate local inspections; every entry simply has no
+    # current reject zone until one is registered.
+    state.setdefault("inspections", {})
+    state.setdefault("inspection_log", [])
     return state
 
 
@@ -198,6 +206,49 @@ def _usable_entry_ids(state):
     return set(_available_entries(state))
 
 
+def current_inspection(state, entry_id):
+    """The inspection record currently adopted by an entry, or None."""
+    record_id = state["inspections"].get(entry_id)
+    if record_id is None:
+        return None
+    return next(record for record in state["inspection_log"]
+                if record["inspection_id"] == record_id)
+
+
+def current_reject_zones(state, entry_id):
+    """Normalized reject zones an entry currently carries (empty when none)."""
+    record = current_inspection(state, entry_id)
+    return record["reject_zones"] if record else []
+
+
+def root_offset_of(state, entry_id):
+    """Coordinate of an entry's local zero inside its initial root stock.
+
+    Salvage offcuts record the offset explicitly when they are created. Older
+    single-offcut entries have no stored root coordinate, so the offset is
+    recovered by walking the original cutting tickets: a normal ticket's
+    offcut begins at its recorded ``offcut_start_mm`` inside the parent.
+    Multi-generation local coordinates are never treated as root coordinates.
+    """
+    entry = state["entries"][entry_id]
+    if entry["kind"] == "stock":
+        return 0
+    source = entry["source"]
+    parent_id = source["parent_entry_id"]
+    parent_offset = root_offset_of(state, parent_id)
+    if "root_offset_mm" in entry:
+        return entry["root_offset_mm"]
+    # Legacy normal-ticket offcut: recover the start from the parent's ticket.
+    job = state["jobs"][source["job_id"]]
+    ticket = next(ticket for ticket in job["result"]["tickets"]
+                  if ticket["stock_id"] == parent_id)
+    return parent_offset + ticket["offcut_start_mm"]
+
+
+def requires_salvage(state, entry_id):
+    return bool(current_reject_zones(state, entry_id))
+
+
 def _summary(tickets, unmet, kerf):
     delivered = sum(len(ticket["cuts"]) for ticket in tickets)
     reusable = sum(t["offcut_length_mm"] for t in tickets if t["offcut_reusable"])
@@ -213,11 +264,19 @@ def build_plan(state, data):
     """Deterministic preview on the state's current revision; mutates nothing."""
     job_id, orders = validate_batch(data)
     entries = _available_entries(state)
+    # A normal plan may never silently cut past a local reject zone; entries
+    # carrying a non-empty current zone must go through the salvage process.
+    entries = {key: entry for key, entry in entries.items()
+               if not requires_salvage(state, key)}
     pseudo = {key: {"material": entry["material"], "length_mm": entry["length_mm"],
                     "trim_head_mm": entry["trim_head_mm"],
                     "trim_tail_mm": entry["trim_tail_mm"]}
               for key, entry in entries.items()}
-    tickets, unmet = compile_tickets(pseudo, orders, data["kerf_mm"], data["min_offcut_mm"])
+    tickets, unmet = compile_tickets(
+        pseudo, orders, data["kerf_mm"], data["min_offcut_mm"],
+        prefer_longest_ids=frozenset(
+            key for key, entry in entries.items()
+            if entry.get("source", {}).get("type") == "salvage_offcut"))
     for ticket in tickets:
         parent = entries[ticket["stock_id"]]
         ticket["entry_kind"] = parent["kind"]
@@ -306,6 +365,7 @@ def _apply_or_replay(state, plan):
     }
     state["jobs"][job_id] = {
         "job_id": job_id,
+        "job_type": "batch",
         "request_sha256": plan["request_sha256"],
         "plan_sha256": _fingerprint(plan),
         "base_revision": plan["base_revision"],
@@ -364,9 +424,10 @@ def _require_known_roots(state, roots):
             raise ValueError(f"unknown stock_id: {root}")
 
 
-def _entry_view(entry, covered):
+def _entry_view(entry, covered, reject_zones=None):
     """Stored entry plus effective quality-aware status and covering incidents."""
     incidents = list(covered.get(entry["root_stock_id"], ()))
+    reject_zones = reject_zones or []
     view = {
         "entry_id": entry["entry_id"],
         "kind": entry["kind"],
@@ -380,9 +441,16 @@ def _entry_view(entry, covered):
         "source": entry["source"],
         "root_stock_id": entry["root_stock_id"],
         "active_incidents": incidents,
+        "reject_zones": reject_zones,
+        "requires_salvage": bool(reject_zones),
     }
     if entry["status"] == "available" and incidents:
         view["status"] = "isolated"
+    # Salvage eligibility is a process dimension, never a consumption state:
+    # an entry blocked only by local defects stays available/isolated and is
+    # merely ineligible for the normal cutting command.
+    view["eligible_for_normal_plan"] = (
+        view["status"] == "available" and not reject_zones)
     return view
 
 
@@ -419,7 +487,8 @@ def _incident_report(state, incident):
     roots = []
     total_pieces = 0
     for root in incident["roots"]:
-        entries = [_entry_view(entry, covered)
+        entries = [_entry_view(entry, covered,
+                               current_reject_zones(state, entry["entry_id"]))
                    for _, entry in sorted(state["entries"].items())
                    if entry["root_stock_id"] == root]
         pieces = _trace_pieces(state, root)
@@ -611,6 +680,317 @@ def incident_status(workspace_dir, incident_id=None):
                      and covered.get(entry["root_stock_id"])]}
                 for _, incident in sorted(state["incidents"].items())],
         }
+
+
+# ---------------------------------------------------------------------------
+# Local inspections and salvage cutting
+#
+# An inspection is a new process basis for one inventory entry: it records
+# the raw zones given by the caller and the normalized union. Every new
+# registration replaces the entry's current inspection and advances the
+# inventory revision exactly once, so all prior normal and salvage previews
+# go stale; cost and finished-goods revisions never move. The inspection
+# itself creates no cost loss -- the rejection only becomes a loss when a
+# salvage commit actually cuts the entry.
+# ---------------------------------------------------------------------------
+
+
+def _inspection_request(inspection_id, entry_id, expected, reject_zones):
+    """Canonical idempotency input; zones compare as the merged union.
+
+    The raw zones stay on the receipt for display, but two inputs whose zones
+    merge to the same union are the same canonical process basis.
+    """
+    return {
+        "inspection_id": inspection_id,
+        "entry_id": entry_id,
+        "expected_inventory_revision": expected,
+        "reject_zones": reject_zones,
+    }
+
+
+def register_inspection(workspace_dir, source_path, output_path=None):
+    data = load(source_path)
+    inspection_id, entry_id, expected, raw_zones = validate_inspection(data)
+    with _locked(workspace_dir):
+        state = _read_state(workspace_dir)
+        # Idempotency has priority over revision and liveness checks: the same
+        # inspection id with the same canonical input replays its frozen
+        # receipt even when the expected revision is stale or the entry has
+        # since been consumed.
+        canonical = _inspection_request(
+            inspection_id, entry_id, expected, merge_reject_zones(raw_zones))
+        for record in state["inspection_log"]:
+            if record["inspection_id"] != inspection_id:
+                continue
+            if record["request_sha256"] == _fingerprint(canonical):
+                result = record["result"]
+                if output_path is not None and _output_ready(output_path, result):
+                    publish(output_path, result)
+                return result
+            raise ConflictError(
+                "inspection_id is already registered with different input: "
+                f"{inspection_id}")
+        entry = state["entries"].get(entry_id)
+        if entry is None:
+            raise ValueError(f"unknown entry_id: {entry_id}")
+        if entry["status"] == "consumed":
+            raise ValueError(
+                f"entry is already consumed and cannot be inspected: {entry_id}")
+        if expected != state["revision"]:
+            raise ValueError(
+                f"expected_inventory_revision is stale: expected {expected}, "
+                f"workspace is at revision {state['revision']}")
+        low = entry["trim_head_mm"]
+        high = entry["length_mm"] - entry["trim_tail_mm"]
+        for start, end in raw_zones:
+            if not (low <= start < end <= high):
+                raise ValueError(
+                    "reject zone must satisfy trim_head_mm <= start_mm < end_mm "
+                    "<= length_mm - trim_tail_mm")
+        reject_zones = merge_reject_zones(raw_zones)
+        raw_zones_sorted = [{"start_mm": start, "end_mm": end}
+                            for start, end in sorted(raw_zones)]
+        previous_id = state["inspections"].get(entry_id)
+        revision = state["revision"] + 1
+        request = _inspection_request(
+            inspection_id, entry_id, expected, reject_zones)
+        result = {
+            "schema_version": SCHEMA,
+            "kind": "stock-workspace-inspection",
+            "workspace_id": state["workspace_id"],
+            "inspection_id": inspection_id,
+            "entry_id": entry_id,
+            "registered_revision": revision,
+            "expected_inventory_revision": expected,
+            "raw_reject_zones": raw_zones_sorted,
+            "reject_zones": reject_zones,
+            "replaced_inspection_id": previous_id,
+            "entry_requires_salvage": bool(reject_zones),
+            "request": request,
+            "request_sha256": _fingerprint(request),
+        }
+        result = json.loads(_canonical(result))
+        needs_publish = output_path is not None and _output_ready(output_path, result)
+        state["inspection_log"].append({
+            "inspection_id": inspection_id, "entry_id": entry_id,
+            "request": request, "request_sha256": _fingerprint(request),
+            "registered_revision": revision,
+            "raw_reject_zones": raw_zones_sorted,
+            "reject_zones": reject_zones, "result": result})
+        state["inspections"][entry_id] = inspection_id
+        state["revision"] = revision
+        _write_state(workspace_dir, state)
+    if needs_publish:
+        publish(output_path, result)
+    return result
+
+
+def inspection_status(workspace_dir, entry_id=None):
+    with _locked(workspace_dir, exclusive=False):
+        state = _read_state(workspace_dir)
+        records = [
+            {"inspection_id": record["inspection_id"],
+             "entry_id": record["entry_id"],
+             "registered_revision": record["registered_revision"],
+             "raw_reject_zones": record.get(
+                 "raw_reject_zones", record["reject_zones"]),
+             "reject_zones": record["reject_zones"],
+             "is_current": state["inspections"].get(record["entry_id"])
+                            == record["inspection_id"]}
+            for record in state["inspection_log"]]
+        if entry_id is not None:
+            if entry_id not in state["entries"]:
+                raise ValueError(f"unknown entry_id: {entry_id}")
+            current = current_inspection(state, entry_id)
+            entry = state["entries"][entry_id]
+            return {
+                "schema_version": SCHEMA,
+                "kind": "stock-workspace-inspection-status",
+                "workspace_id": state["workspace_id"],
+                "revision": state["revision"],
+                "entry_id": entry_id,
+                "entry_status": entry["status"],
+                "current_inspection_id": current["inspection_id"] if current else None,
+                "current_reject_zones": current["reject_zones"] if current else [],
+                "requires_salvage": bool(current and current["reject_zones"]),
+                "inspections": [record for record in records
+                                if record["entry_id"] == entry_id],
+            }
+        return {
+            "schema_version": SCHEMA,
+            "kind": "stock-workspace-inspection-list",
+            "workspace_id": state["workspace_id"],
+            "revision": state["revision"],
+            "inspections": records,
+            "current_by_entry": dict(sorted(state["inspections"].items())),
+        }
+
+
+def _salvage_offcut_entry(job_id, parent, offcut):
+    """One clean salvage remainder; trims are zero and its own length starts at 0."""
+    return {
+        "entry_id": offcut["entry_id"],
+        "kind": "offcut",
+        "material": parent["material"],
+        "length_mm": offcut["length_mm"],
+        "trim_head_mm": 0,
+        "trim_tail_mm": 0,
+        "usable_mm": offcut["length_mm"],
+        "status": "available",
+        "consumed_by": None,
+        "source": {"type": "salvage_offcut", "job_id": job_id,
+                   "parent_entry_id": parent["entry_id"],
+                   "stock_id": parent["root_stock_id"]},
+        "root_stock_id": parent["root_stock_id"],
+        "root_offset_mm": offcut["root_offset_mm"],
+        "parent_start_mm": offcut["start_mm"],
+        "parent_end_mm": offcut["end_mm"],
+    }
+
+
+def build_salvage_plan(state, data):
+    """Pure salvage preview pinned to the current inventory revision."""
+    job_id, orders, candidate_ids = validate_salvage(data)
+    kerf = integer(data["kerf_mm"], "kerf_mm")
+    min_offcut = integer(data["min_offcut_mm"], "min_offcut_mm")
+    covered = _active_root_incidents(state)
+    candidates = []
+    inspections = {}
+    for entry_id in candidate_ids:
+        entry = state["entries"].get(entry_id)
+        if entry is None:
+            raise ValueError(f"unknown candidate entry_id: {entry_id}")
+        if entry["status"] != "available":
+            raise ValueError(
+                f"candidate entry is not available: {entry_id} "
+                f"(status={entry['status']})")
+        if entry["root_stock_id"] in covered:
+            raise ValueError(
+                f"candidate entry is isolated by an active quality incident: "
+                f"{entry_id}")
+        candidates.append(entry)
+        record = current_inspection(state, entry_id)
+        if record is not None:
+            inspections[entry_id] = record
+    root_offsets = {entry["entry_id"]: root_offset_of(state, entry["entry_id"])
+                    for entry in candidates}
+    plan = salvage_mod.build_plan(
+        state["workspace_id"], state["revision"], job_id, candidates,
+        inspections, orders, kerf, min_offcut, root_offsets)
+    # Pre-build the would-be inventory entries so commit can verify identity.
+    plan["added_entries"] = [
+        _salvage_offcut_entry(job_id, state["entries"][offcut["parent_entry_id"]],
+                              offcut)
+        for offcut in plan["added_offcuts"]]
+    return plan
+
+
+def salvage_plan(workspace_dir, source_path, output_path):
+    data = load(source_path)
+    with _locked(workspace_dir, exclusive=False):
+        result = build_salvage_plan(_read_state(workspace_dir), data)
+    publish(output_path, result)
+    return result
+
+
+def _validate_salvage_plan_shape(plan):
+    if plan.get("kind") != "stock-workspace-salvage-plan" \
+            or plan.get("schema_version") != SCHEMA:
+        raise ValueError("not a supported stock-workspace salvage plan")
+    for key in ("workspace_id", "base_revision", "job_id", "request",
+                "request_sha256", "candidates", "tickets", "unfilled",
+                "placement_sequence", "consumed_entry_ids",
+                "unused_candidate_entry_ids", "added_entries", "metrics"):
+        if key not in plan:
+            raise ValueError(f"salvage plan is missing {key}")
+    integer(plan["base_revision"], "base_revision")
+    text(plan["job_id"], "job_id")
+    if plan["request_sha256"] != _fingerprint(plan["request"]):
+        raise ValueError("salvage plan request does not match its recorded hash")
+
+
+def _apply_salvage(state, plan):
+    """Validate a salvage plan against live state and mutate state in memory.
+
+    Returns ``(result, replayed)``. Normal and salvage jobs share one
+    ``job_id`` namespace, so the same id can never deduct stock twice.
+    """
+    _validate_salvage_plan_shape(plan)
+    if plan["workspace_id"] != state["workspace_id"]:
+        raise ValueError("salvage plan belongs to a different workspace")
+    job_id = plan["job_id"]
+    existing = state["jobs"].get(job_id)
+    if existing is not None:
+        if (existing["plan_sha256"] == _fingerprint(plan)
+                and existing["request_sha256"] == plan["request_sha256"]):
+            return existing["result"], True
+        raise ConflictError(
+            f"job_id is already committed with a different request or plan: {job_id}")
+    if plan["base_revision"] != state["revision"]:
+        raise StalePlanError(
+            f"salvage plan is stale: based on revision {plan['base_revision']}, "
+            f"workspace is at revision {state['revision']}")
+    rebuilt = build_salvage_plan(state, plan["request"])
+    if rebuilt != plan:
+        raise ValueError("salvage plan content does not match the current "
+                         "workspace state")
+    revision = state["revision"] + 1
+    for entry_id in plan["consumed_entry_ids"]:
+        entry = state["entries"][entry_id]
+        entry["status"] = "consumed"
+        entry["consumed_by"] = job_id
+    for entry in plan["added_entries"]:
+        state["entries"][entry["entry_id"]] = dict(entry)
+    state["revision"] = revision
+    # Salvage produces real finished goods, so the finished-goods revision
+    # advances once; the price/cost revision never moves. A zero-piece salvage
+    # still records a valid job and advances both revisions once, but consumes
+    # no inventory.
+    state["finished_revision"] += 1
+    result = {
+        "schema_version": SCHEMA,
+        "kind": "stock-workspace-salvage-commit",
+        "workspace_id": state["workspace_id"],
+        "job_id": job_id,
+        "job_type": "salvage",
+        "base_revision": plan["base_revision"],
+        "revision": revision,
+        "request": plan["request"],
+        "request_sha256": plan["request_sha256"],
+        "candidates": plan["candidates"],
+        "tickets": plan["tickets"],
+        "unfilled": plan["unfilled"],
+        "placement_sequence": plan["placement_sequence"],
+        "consumed_entry_ids": plan["consumed_entry_ids"],
+        "unused_candidate_entry_ids": plan["unused_candidate_entry_ids"],
+        "added_entries": plan["added_entries"],
+        "metrics": plan["metrics"],
+    }
+    state["jobs"][job_id] = {
+        "job_id": job_id,
+        "job_type": "salvage",
+        "request_sha256": plan["request_sha256"],
+        "plan_sha256": _fingerprint(plan),
+        "base_revision": plan["base_revision"],
+        "revision": revision,
+        "result": result,
+    }
+    return result, False
+
+
+def salvage_commit(workspace_dir, plan_path, output_path):
+    plan_data = load(plan_path)
+    with _locked(workspace_dir):
+        state = _read_state(workspace_dir)
+        result, replayed = _apply_salvage(state, plan_data)
+        needs_publish = _output_ready(output_path, result)
+        if not replayed:
+            _write_state(workspace_dir, state)
+    result = json.loads(_canonical(result))
+    if needs_publish:
+        publish(output_path, result)
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -1150,7 +1530,8 @@ def status(workspace_dir, job_id=None):
                 raise ValueError(f"unknown job_id: {job_id}")
             return job["result"]
         covered = _active_root_incidents(state)
-        entries = [_entry_view(state["entries"][key], covered)
+        entries = [_entry_view(state["entries"][key], covered,
+                               current_reject_zones(state, key))
                    for key in sorted(state["entries"])]
         by_material = {}
         isolated_by_material = {}

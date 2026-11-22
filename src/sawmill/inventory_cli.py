@@ -90,6 +90,32 @@ def main():
     daffected_p.add_argument("--workspace", required=True)
     daffected_p.add_argument("--incident", required=True)
 
+    inspection_p = sub.add_parser("inspection", help="局部检验登记与查询")
+    inspection_sub = inspection_p.add_subparsers(
+        dest="inspection_command", required=True)
+
+    iregister_p = inspection_sub.add_parser("register", help="登记条目的局部剔除区检验")
+    iregister_p.add_argument("--workspace", required=True)
+    iregister_p.add_argument("--source", required=True)
+    iregister_p.add_argument("--output", required=True)
+
+    istatus_p = inspection_sub.add_parser("status", help="查询局部检验记录")
+    istatus_p.add_argument("--workspace", required=True)
+    istatus_p.add_argument("--entry", default=None)
+
+    salvage_p = sub.add_parser("salvage", help="局部缺陷回收切割")
+    salvage_sub = salvage_p.add_subparsers(dest="salvage_command", required=True)
+
+    splan_p = salvage_sub.add_parser("plan", help="基于当前库存修订版生成回收计划")
+    splan_p.add_argument("--workspace", required=True)
+    splan_p.add_argument("--source", required=True)
+    splan_p.add_argument("--output", required=True)
+
+    scommit_p = salvage_sub.add_parser("commit", help="提交回收计划，生效库存变更")
+    scommit_p.add_argument("--workspace", required=True)
+    scommit_p.add_argument("--plan", required=True)
+    scommit_p.add_argument("--output", required=True)
+
     args = parser.parse_args()
     try:
         if args.command == "init":
@@ -129,6 +155,19 @@ def main():
                 result = workspace.delivery_status(args.workspace, args.dispatch)
             else:
                 result = workspace.delivery_affected(args.workspace, args.incident)
+        elif args.command == "inspection":
+            if args.inspection_command == "register":
+                result = workspace.register_inspection(
+                    args.workspace, args.source, args.output)
+            else:
+                result = workspace.inspection_status(args.workspace, args.entry)
+        elif args.command == "salvage":
+            if args.salvage_command == "plan":
+                result = workspace.salvage_plan(
+                    args.workspace, args.source, args.output)
+            else:
+                result = workspace.salvage_commit(
+                    args.workspace, args.plan, args.output)
         else:
             result = workspace.status(args.workspace, args.job)
     except (OSError, ValueError, KeyError, TypeError, OverflowError) as exc:

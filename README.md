@@ -118,8 +118,26 @@ uv pip check --python .venv/bin/python
 - 成品修订版独立于库存/成本修订版：新切割提交、质量事件首次登记或解除、新交付提交各推进一次（幂等重放不推进）；事件即使不改变可用库存也推进；价格登记与关账不推进。交付不推进库存或成本修订版、不改动切割票与成本明细、不使切割计划过期。
 - `delivery status` 列出全部成品的归属与 `available`/`isolated`/`delivered` 状态及活动事件——已交付与质量覆盖是两个维度，召回不把实物放回待配池。`delivery status --dispatch` 返回原冻结清单并另列当前受影响套件：任一槽位根被活动事件覆盖则整套召回，只列真正来自被覆盖根的实物。`delivery affected --incident` 按根与真实交付事实定位全部历史交付（活动或已解除事件均可），并显示事件是否仍活动；未知事件或交付退出2。
 
+### 局部检验与回收切割
+
+发现已经定位、允许剔除的局部节疤时，先登记局部检验，再用专用回收工艺把干净料道加工成订单件；普通批次不能绕过局部缺陷，回收产生的多段干净余料自动进入同一库存、成本与交付链。
+
+```sh
+.venv/bin/stock-workspace inspection register --workspace run/ws --source fixtures/inspection-s1.json --output run/inspection.json
+.venv/bin/stock-workspace inspection status --workspace run/ws --entry stock/S1
+.venv/bin/stock-workspace salvage plan --workspace run/ws --source fixtures/salvage1.json --output run/salvage-plan.json
+.venv/bin/stock-workspace salvage commit --workspace run/ws --plan run/salvage-plan.json --output run/salvage-result.json
+```
+
+- 检验输入为非空 `inspection_id`、`entry_id`、非负严格整数 `expected_inventory_revision` 与最多32个 `reject_zones`；区间为条目自身坐标下的半开区间，必须落在头尾修边之间，允许重叠、相接、乱序，登记时合并为并集。空数组表示本次检验无缺陷。布尔值冒充整数、未知或已消耗条目、非法坐标、期待版本过期均退出2。
+- 每次成功的新登记替换该条目当前检验并把库存修订版推进一次（区域相同或为空也推进），不推进成本或成品修订版；相同 `inspection_id` 相同规范输入（期待版本保留、区域按合并并集比较）优先返回原冻结回执，即使版本已过期或条目后来已消耗；同 id 不同输入冲突。检验登记使此前普通与回收计划都过期。
+- 普通 `plan` 只使用无当前非空剔除区的条目；`status` 在既有可用/消耗/隔离维度之外显示每条目的 `reject_zones`、`requires_salvage` 与 `eligible_for_normal_plan`。被整根质量事件隔离的条目可以登记检验，但两种工艺都不能使用该根库存，检验不解除隔离。
+- 回收请求增加 1至4 个互不重复的 `candidate_entry_ids`，只从清单选料；候选合计最多8条料道、订单展开最多12件，超限明确失败。方案在“件数→成品总长→不可回收损耗→消耗父条目总长→规范放置序列”五层口径下求全局唯一最优，不是逐料道贪心；允许配成0件（此时登记有效工单、推进修订版但不消耗库存）。
+- 加工至少一件的候选被整根消耗：票的 `partitions` 完整划分整个物理长度，区分头尾修边、`defect_reject` 剔除段、成品、锯缝、可回收余料与废料，并同时给出局部坐标与根坐标。同父多段余料身份为 `offcut/<job_id>/<父条目>#<序号>`，自身从零计长、修边为0、初始无剔除区，可直接供普通 `plan` 使用；旧单尾料身份与多代根偏移保持可恢复。
+- 回收与普通提交共用 `job_id` 身份空间与提交锁；成本按整张父票跨全部料道一次整数分摊（剔除段类别为 `defect_reject`），每段余料各自携带分币，价格更正沿混合来源链传递，关账桥接与冻结结果保持正确。回收成品以原四元引用进入 `delivery`，质量召回沿根覆盖全部新旧分支。
+
 ## 契约与边界
 
-详见[数据契约](docs/contract.md)。采用确定性best-fit decreasing可行启发式，不保证最优。缺件是有效业务结果，见summary.complete及unfilled。
+详见[数据契约](docs/contract.md)。普通批次采用确定性best-fit decreasing可行启发式，不保证最优；回收切割则在固定工艺下求全局唯一最优。缺件是有效业务结果，见summary.complete及unfilled。
 
 样例均为本仓原创合成数据，来源见[说明](fixtures/SOURCES.md)，代码/样例MIT许可。业务演示和测试不访问网络，不需要容器或外部服务。
