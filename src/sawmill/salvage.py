@@ -184,7 +184,14 @@ class _Search:
 
 
 def _lane_view(entry, reject_zones, entry_index, root_offset):
-    """Lanes of one candidate enriched with material and root coordinates."""
+    """Lanes of one candidate enriched with material and root coordinates.
+
+    ``root_offset`` is the coordinate of the candidate entry's local zero
+    inside its initial root stock; it is added to every local lane coordinate,
+    including when the candidate is a multi-generation descendant whose local
+    zero does not coincide with the root (legacy offcuts, salvage branches,
+    customer-return rework stock).
+    """
     return [{
         "entry_index": entry_index,
         "entry_id": entry["entry_id"],
@@ -216,8 +223,9 @@ def build_plan(workspace_id, revision, job_id, candidates, inspections, orders,
         record = inspections.get(entry["entry_id"])
         reject_zones = record["reject_zones"] if record else []
         inspection_id = record["inspection_id"] if record else None
+        entry_root_offset = root_offsets[entry["entry_id"]]
         entry_lanes = _lane_view(entry, reject_zones, entry_index,
-                                 root_offsets[entry["entry_id"]])
+                                 entry_root_offset)
         lanes.extend(entry_lanes)
         lane_entries.append({
             "entry_index": entry_index,
@@ -373,7 +381,11 @@ def build_plan(workspace_id, revision, job_id, candidates, inspections, orders,
             "reject_zones": candidate_views[entry_index]["reject_zones"],
             "lanes": lane_reports,
             "partitions": partitions,
-            "root_offset_mm": root_offset,
+            # Absolute coordinate of the entry's local zero inside its root;
+            # salvage may consume initial stock (offset 0) or any descendant
+            # such as a multi-generation offcut or a customer-return rework
+            # identity, whose offsets are never zero.
+            "root_offset_mm": root_offsets[entry["entry_id"]],
         })
         consumed_entry_ids.append(entry["entry_id"])
 

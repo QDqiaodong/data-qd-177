@@ -116,6 +116,18 @@ def main():
     scommit_p.add_argument("--plan", required=True)
     scommit_p.add_argument("--output", required=True)
 
+    return_p = sub.add_parser("return", help="客户退回成品登记与再制造返料查询")
+    return_sub = return_p.add_subparsers(dest="return_command", required=True)
+
+    rregister_p = return_sub.add_parser("register", help="登记完整成品退回并一次性转为返料")
+    rregister_p.add_argument("--workspace", required=True)
+    rregister_p.add_argument("--source", required=True)
+    rregister_p.add_argument("--output", required=True)
+
+    rstatus_p = return_sub.add_parser("status", help="查询退回回单与返料当前状态")
+    rstatus_p.add_argument("--workspace", required=True)
+    rstatus_p.add_argument("--return", dest="return_id", default=None)
+
     args = parser.parse_args()
     try:
         if args.command == "init":
@@ -168,6 +180,12 @@ def main():
             else:
                 result = workspace.salvage_commit(
                     args.workspace, args.plan, args.output)
+        elif args.command == "return":
+            if args.return_command == "register":
+                result = workspace.register_return(
+                    args.workspace, args.source, args.output)
+            else:
+                result = workspace.return_status(args.workspace, args.return_id)
         else:
             result = workspace.status(args.workspace, args.job)
     except (OSError, ValueError, KeyError, TypeError, OverflowError) as exc:

@@ -113,30 +113,89 @@ def _loss_row(job_id, entry, segment, category, root, material, amount):
             "amount_cents": amount}
 
 
+def _piece_key(job_id, entry_id, order_id, unit):
+    return (job_id, entry_id, order_id, unit)
+
+
 def build_cost_detail(state, revision, prices):
     """Cost detail at an inventory snapshot under the given root prices.
 
-    ``revision`` selects committed jobs (only jobs committed at a revision not
-    greater than ``revision`` exist at the snapshot); ``prices`` maps every
-    root stock id to its adopted purchase cost. Inventory is reconstructed
-    from the source chain at that snapshot, never from the live ``status``
-    field, so consumed-at-snapshot and not-yet-existing entries are exact.
+    ``revision`` selects the physical facts visible at the snapshot: only jobs
+    committed at a revision not greater than ``revision`` and only returns
+    registered at a revision not greater than ``revision`` exist there;
+    ``prices`` maps every root stock id to its adopted purchase cost.
+
+    Inventory is reconstructed from the source chain at that snapshot, never
+    from the live ``status`` field, so consumed-at-snapshot and not-yet-existing
+    entries are exact. A customer return is a lossless value transfer: the
+    original finished piece keeps its line identity but its amount becomes
+    zero at and after the return, while the new rework stock identity carries
+    the piece's exact integer cost -- never a re-apportionment by length.
     """
     jobs = sorted((job for job in state["jobs"].values()
                    if job["revision"] <= revision),
                   key=lambda job: job["revision"])
+    returns = [record for record in (state.get("returns", {}).get(return_id)
+                                     for return_id in state.get("return_order", ()))
+               if record is not None and record["inventory_revision"] <= revision]
     entries = state["entries"]
     consumed = set()
     offcut_costs = {}
-    pieces, losses, tickets = [], [], []
-    for job in jobs:
+    # The exact integer cost every finished piece received from its real
+    # parent ticket, under the adopted prices of this projection.
+    piece_costs = {}
+    # Piece reference tuple -> (return_id, return record item) for the
+    # snapshot's returns.
+    returned_at_snapshot = {}
+    for record in returns:
+        for item in record["result"]["items"]:
+            piece = item["piece"]
+            returned_at_snapshot[_piece_key(piece["job_id"], piece["entry_id"],
+                                            piece["order_id"], piece["unit"])] = \
+                (record["return_id"], item)
+    pieces, losses, tickets, transfers = [], [], [], []
+
+    def input_cents_for(entry):
+        if entry["kind"] == "stock":
+            return prices[entry["root_stock_id"]]
+        if entry["kind"] == "return":
+            source_piece = entry["source"]["original_piece"]
+            return piece_costs[_piece_key(source_piece["job_id"],
+                                          source_piece["entry_id"],
+                                          source_piece["order_id"],
+                                          source_piece["unit"])]
+        return offcut_costs[entry["entry_id"]]
+
+    # Returns and cutting commits interleave in revision order; a return must
+    # be applied before any later ticket that consumes its rework stock.
+    timeline = ([("job", job["revision"], seq, job) for seq, job in enumerate(jobs)]
+                + [("return", record["inventory_revision"], seq, record)
+                   for seq, record in enumerate(returns)])
+    for kind, _event_revision, _seq, event in sorted(
+            timeline, key=lambda event: (event[1], 0 if event[0] == "job" else 1,
+                                        event[2])):
+        if kind == "return":
+            record = event
+            for item in record["result"]["items"]:
+                piece = item["piece"]
+                key = _piece_key(piece["job_id"], piece["entry_id"],
+                                 piece["order_id"], piece["unit"])
+                amount = piece_costs[key]
+                transfers.append({
+                    "return_id": record["return_id"],
+                    "inventory_revision": record["inventory_revision"],
+                    "source_piece": dict(piece),
+                    "target_entry_id": item["return_entry_id"],
+                    "root_stock_id": item["root_stock_id"],
+                    "material": entries[item["return_entry_id"]]["material"],
+                    "amount_cents": amount,
+                })
+            continue
+        job = event
         for ticket in job["result"]["tickets"]:
             entry = entries[ticket["stock_id"]]
             root = entry["root_stock_id"]
-            if entry["kind"] == "stock":
-                input_cents = prices[root]
-            else:
-                input_cents = offcut_costs[entry["entry_id"]]
+            input_cents = input_cents_for(entry)
             segments = ticket_segments(ticket, entry)
             amounts = allocate_cents(input_cents,
                                      [segment["length_mm"] for segment in segments])
@@ -148,8 +207,22 @@ def build_cost_detail(state, revision, prices):
                 if segment["kind"] == "piece":
                     row["order_id"] = segment["order_id"]
                     row["unit"] = segment["unit"]
-                    pieces.append(_piece_row(job["job_id"], entry, segment,
-                                             root, ticket["material"], amount))
+                    key = _piece_key(job["job_id"], entry["entry_id"],
+                                     segment["order_id"], segment["unit"])
+                    piece_costs[key] = amount
+                    returned = returned_at_snapshot.get(key)
+                    piece_row = _piece_row(job["job_id"], entry, segment,
+                                           root, ticket["material"], amount)
+                    if returned is not None:
+                        # The original piece line keeps the piece identity; its
+                        # current value is zero and the transfer names the
+                        # rework identity now holding the cost.
+                        return_id, returned_item = returned
+                        piece_row["amount_cents"] = 0
+                        piece_row["returned_by"] = return_id
+                        piece_row["return_entry_id"] = \
+                            returned_item["return_entry_id"]
+                    pieces.append(piece_row)
                 elif segment["kind"] == "offcut":
                     row["reusable"] = segment["reusable"]
                     if segment["reusable"]:
@@ -171,16 +244,26 @@ def build_cost_detail(state, revision, prices):
                             "entry_id": entry["entry_id"], "entry_kind": entry["kind"],
                             "root_stock_id": root, "material": ticket["material"],
                             "input_cents": input_cents, "segments": rows})
-    included = {job["job_id"] for job in jobs}
+    included_jobs = {job["job_id"] for job in jobs}
+    included_returns = {record["return_id"] for record in returns}
     inventory = []
     for entry_id in sorted(entries):
         entry = entries[entry_id]
-        if entry["kind"] == "offcut" and entry["source"]["job_id"] not in included:
+        if entry["kind"] == "offcut" and entry["source"]["job_id"] not in included_jobs:
             continue  # the offcut does not exist yet at this snapshot
+        if entry["kind"] == "return" \
+                and entry["source"]["return_id"] not in included_returns:
+            continue  # the rework stock does not exist yet at this snapshot
         if entry_id in consumed:
             continue  # already consumed at this snapshot: no longer inventory
         if entry["kind"] == "stock":
             amount = prices[entry["root_stock_id"]]
+        elif entry["kind"] == "return":
+            source_piece = entry["source"]["original_piece"]
+            amount = piece_costs[_piece_key(source_piece["job_id"],
+                                            source_piece["entry_id"],
+                                            source_piece["order_id"],
+                                            source_piece["unit"])]
         else:
             amount = offcut_costs[entry_id]
         inventory.append({"entry_id": entry_id, "kind": entry["kind"],
@@ -188,7 +271,7 @@ def build_cost_detail(state, revision, prices):
                           "material": entry["material"],
                           "length_mm": entry["length_mm"], "amount_cents": amount})
     return {"pieces": pieces, "losses": losses, "inventory": inventory,
-            "tickets": tickets,
+            "tickets": tickets, "value_transfers": transfers,
             "summary": _detail_summary(pieces, losses, inventory, entries, prices)}
 
 

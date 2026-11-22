@@ -30,7 +30,7 @@ from .io import load, publish, integer, text, canonical, fingerprint
 from .layout import compile_tickets
 from .model import (validate_stock_rows, validate_batch, validate_incident,
                     validate_price, validate_close, validate_inspection,
-                    validate_salvage, merge_reject_zones)
+                    validate_salvage, validate_return, merge_reject_zones)
 from . import costing
 from . import delivery
 from . import salvage as salvage_mod
@@ -121,6 +121,8 @@ def _initial_state(stock):
         "jobs": {},
         "incidents": {},
         "dispatches": {},
+        "returns": {},
+        "return_order": [],
         "inspections": {},
         "inspection_log": [],
     }
@@ -148,6 +150,10 @@ def _read_state(workspace_dir):
     # current reject zone until one is registered.
     state.setdefault("inspections", {})
     state.setdefault("inspection_log", [])
+    # Older workspaces predate customer returns; no finished piece has ever
+    # been converted back into rework stock until a return is registered.
+    state.setdefault("returns", {})
+    state.setdefault("return_order", [])
     return state
 
 
@@ -234,6 +240,11 @@ def root_offset_of(state, entry_id):
     if entry["kind"] == "stock":
         return 0
     source = entry["source"]
+    if source["type"] == "return":
+        # Rework stock stores its absolute root offset explicitly; the local
+        # piece start is a coordinate on the original finished-goods source,
+        # never a root coordinate by itself.
+        return entry["root_offset_mm"]
     parent_id = source["parent_entry_id"]
     parent_offset = root_offset_of(state, parent_id)
     if "root_offset_mm" in entry:
@@ -1257,11 +1268,14 @@ def _delivered_map(state):
 
 
 def _delivery_view(state):
+    returned = {ref: return_id for ref, (return_id, _item)
+                in _returned_piece_map(state).items()}
     return {"workspace_id": state["workspace_id"],
             "finished_revision": state["finished_revision"],
             "catalog": _finished_catalog(state),
             "delivered_by": _delivered_map(state),
-            "covered_roots": _active_root_incidents(state)}
+            "covered_roots": _active_root_incidents(state),
+            "returned_by": returned}
 
 
 def delivery_plan(workspace_dir, source_path, output_path):
@@ -1367,10 +1381,12 @@ def delivery_status(workspace_dir, dispatch_id=None):
             if record is None:
                 raise ValueError(f"unknown dispatch_id: {dispatch_id}")
             result = record["result"]
+            returned = _returned_piece_map(state)
             kits = []
             for kit in result["selected_kits"]:
                 affected = []
                 kit_incidents = set()
+                returned_slots = []
                 for slot in kit["slots"]:
                     piece = slot["piece"]
                     incidents = list(covered.get(piece["root_stock_id"], ()))
@@ -1383,10 +1399,20 @@ def delivery_status(workspace_dir, dispatch_id=None):
                             "root_stock_id": piece["root_stock_id"],
                             "active_incidents": incidents})
                         kit_incidents.update(incidents)
+                    return_record = returned.get(_piece_ref_tuple(piece))
+                    if return_record is not None:
+                        return_id, return_item = return_record
+                        returned_slots.append({
+                            "slot_id": slot["slot_id"],
+                            "piece": dict(piece),
+                            "returned_by": return_id,
+                            "return_entry_id": return_item["return_entry_id"],
+                            "returned": True})
                 kits.append({"kit_id": kit["kit_id"],
                              "recall": bool(affected),
                              "active_incidents": sorted(kit_incidents),
-                             "affected_pieces": affected})
+                             "affected_pieces": affected,
+                             "returned_slots": returned_slots})
             return {
                 "schema_version": SCHEMA,
                 "kind": "stock-workspace-delivery-detail",
@@ -1403,19 +1429,27 @@ def delivery_status(workspace_dir, dispatch_id=None):
             }
         catalog = _finished_catalog(state)
         delivered_by = _delivered_map(state)
+        returned = _returned_piece_map(state)
         pieces = []
         for ref in sorted(catalog):
             facts = catalog[ref]
             incidents = list(covered.get(facts["root_stock_id"], ()))
             owner = delivered_by.get(ref)
+            return_record = returned.get(ref)
             if owner is not None:
                 status = "delivered"
             elif incidents:
                 status = "isolated"
             else:
                 status = "available"
-            pieces.append({**facts, "status": status, "delivered_by": owner,
-                           "active_incidents": incidents})
+            pieces.append({
+                **facts, "status": status, "delivered_by": owner,
+                "active_incidents": incidents,
+                "returned_by": return_record[0] if return_record else None,
+                "return_entry_id": (return_record[1]["return_entry_id"]
+                                    if return_record else None),
+                "returned": return_record is not None,
+            })
         dispatches = [
             {"dispatch_id": key,
              "finished_revision": record["finished_revision"],
@@ -1472,6 +1506,303 @@ def delivery_affected(workspace_dir, incident_id):
             "status": incident["status"],
             "roots": list(incident["roots"]),
             "deliveries": deliveries,
+        }
+
+
+# ---------------------------------------------------------------------------
+# Customer returns: finished goods received back and converted once into
+# rework stock
+#
+# A return is a physical goods-receipt fact, never a request or a reversal of
+# the original delivery: the dispatch keeps occupying the original four-field
+# piece forever. One successful registration atomically creates one new
+# ``kind == "return"`` inventory identity per item and freezes a receipt. The
+# value transfer itself carries no money -- costing moves the original piece's
+# integer cost onto the new identity at read time, so later price corrections
+# still flow through every real parent ticket.
+# ---------------------------------------------------------------------------
+
+
+def _piece_ref_tuple(piece):
+    return (piece["job_id"], piece["entry_id"],
+            piece["order_id"], piece["unit"])
+
+
+def _canonical_return_request(return_id, expected_inventory, expected_finished,
+                              items):
+    """Order-insensitive semantic identity of a return registration request."""
+    normalized = sorted(
+        ({"dispatch_id": item["dispatch_id"], "kit_id": item["kit_id"],
+          "slot_id": item["slot_id"],
+          "piece": [item["piece"]["job_id"], item["piece"]["entry_id"],
+                    item["piece"]["order_id"], item["piece"]["unit"]]}
+         for item in items),
+        key=lambda item: (item["piece"][0], item["piece"][1],
+                          item["piece"][2], item["piece"][3],
+                          item["dispatch_id"], item["kit_id"], item["slot_id"]))
+    return {"return_id": return_id,
+            "expected_inventory_revision": expected_inventory,
+            "expected_finished_revision": expected_finished,
+            "items": normalized}
+
+
+def _dispatch_slot(state, dispatch_id, kit_id, slot_id):
+    """The frozen slot record of a successful dispatch, or None when absent."""
+    record = state["dispatches"].get(dispatch_id)
+    if record is None:
+        return None
+    for kit in record["result"]["selected_kits"]:
+        if kit["kit_id"] != kit_id:
+            continue
+        for slot in kit["slots"]:
+            if slot["slot_id"] == slot_id:
+                return slot
+    return None
+
+
+def _find_cut(state, piece):
+    """The committed cut fact (ticket + cut row + source entry) for a piece."""
+    job = state["jobs"].get(piece["job_id"])
+    if job is None:
+        return None
+    for ticket in job["result"]["tickets"]:
+        if ticket["stock_id"] != piece["entry_id"]:
+            continue
+        for cut in ticket["cuts"]:
+            if cut["order_id"] == piece["order_id"] and cut["unit"] == piece["unit"]:
+                return ticket, cut
+    return None
+
+
+def _returned_piece_map(state):
+    """Piece reference tuple -> (return_id, item) across every successful return."""
+    occupied = {}
+    for return_id in state.get("return_order", ()):
+        record = state["returns"][return_id]
+        for item in record["result"]["items"]:
+            occupied[_piece_ref_tuple(item["piece"])] = (return_id, item)
+    return occupied
+
+
+def _return_entry(state, return_id, seq, item, slot_piece, ticket, cut,
+                  source_entry):
+    """One new rework stock identity; its length starts at zero with no trims."""
+    length = cut["end_mm"] - cut["start_mm"]
+    # Cut coordinates are local to the consumed entry; adding that entry's
+    # absolute root offset makes a true root coordinate for every source kind
+    # (initial stock, normal/salvage offcuts, or an earlier rework identity).
+    root_offset = root_offset_of(state, source_entry["entry_id"]) + cut["start_mm"]
+    return {
+        "entry_id": f"return/{return_id}/{seq}",
+        "kind": "return",
+        "material": slot_piece["material"],
+        "length_mm": length,
+        "trim_head_mm": 0,
+        "trim_tail_mm": 0,
+        "usable_mm": length,
+        "status": "available",
+        "consumed_by": None,
+        "source": {
+            "type": "return",
+            "return_id": return_id,
+            "dispatch_id": item["dispatch_id"],
+            "kit_id": item["kit_id"],
+            "slot_id": item["slot_id"],
+            "original_piece": dict(item["piece"]),
+            "original_entry_id": slot_piece["entry_id"],
+            "original_job_id": slot_piece["job_id"],
+        },
+        "root_stock_id": source_entry["root_stock_id"],
+        "root_offset_mm": root_offset,
+        "piece_start_mm": cut["start_mm"],
+        "piece_end_mm": cut["end_mm"],
+        "piece_root_start_mm": root_offset,
+        "piece_root_end_mm": root_offset + length,
+    }
+
+
+def _build_return(state, data):
+    """Validate and apply a new return in memory; raises on any invalid item."""
+    return_id, expected_inventory, expected_finished, items = validate_return(data)
+    request = _canonical_return_request(
+        return_id, expected_inventory, expected_finished, items)
+    already_returned = _returned_piece_map(state)
+    receipt_items = []
+    new_entries = []
+    for seq, item in enumerate(items, start=1):
+        ref = _piece_ref_tuple(item["piece"])
+        if ref in already_returned:
+            raise ValueError(
+                f"piece has already been returned by "
+                f"{already_returned[ref][0]}: {item['piece']}")
+        slot = _dispatch_slot(state, item["dispatch_id"],
+                              item["kit_id"], item["slot_id"])
+        if slot is None:
+            raise ValueError(
+                "no successfully delivered slot matches "
+                f"{item['dispatch_id']}/{item['kit_id']}/{item['slot_id']}")
+        slot_piece = slot["piece"]
+        if _piece_ref_tuple(slot_piece) != ref:
+            raise ValueError(
+                f"piece does not match the physical piece frozen in slot "
+                f"{item['dispatch_id']}/{item['kit_id']}/{item['slot_id']}")
+        found = _find_cut(state, item["piece"])
+        if found is None:
+            raise ValueError(f"unknown physical piece reference: {item['piece']}")
+        ticket, cut = found
+        source_entry = state["entries"][ticket["stock_id"]]
+        entry = _return_entry(state, return_id, seq, item, slot_piece,
+                              ticket, cut, source_entry)
+        if entry["entry_id"] in state["entries"]:
+            raise ConflictError(
+                f"rework stock identity already exists: {entry['entry_id']}")
+        new_entries.append(entry)
+        receipt_items.append({
+            "dispatch_id": item["dispatch_id"],
+            "kit_id": item["kit_id"],
+            "slot_id": item["slot_id"],
+            "piece": dict(item["piece"]),
+            "original_entry_id": slot_piece["entry_id"],
+            "root_stock_id": source_entry["root_stock_id"],
+            "length_mm": entry["length_mm"],
+            "piece_start_mm": cut["start_mm"],
+            "piece_end_mm": cut["end_mm"],
+            "root_start_mm": entry["piece_root_start_mm"],
+            "root_end_mm": entry["piece_root_end_mm"],
+            "return_entry_id": entry["entry_id"],
+            "source": dict(entry["source"]),
+        })
+    before_inventory = state["revision"]
+    before_finished = state["finished_revision"]
+    for entry in new_entries:
+        state["entries"][entry["entry_id"]] = entry
+    state["revision"] = before_inventory + 1
+    state["finished_revision"] = before_finished + 1
+    result = {
+        "schema_version": SCHEMA,
+        "kind": "stock-workspace-return",
+        "workspace_id": state["workspace_id"],
+        "return_id": return_id,
+        "request": request,
+        "request_sha256": _fingerprint(request),
+        "before_inventory_revision": before_inventory,
+        "after_inventory_revision": state["revision"],
+        "before_finished_revision": before_finished,
+        "after_finished_revision": state["finished_revision"],
+        "items": receipt_items,
+    }
+    result = json.loads(_canonical(result))
+    state["returns"][return_id] = {
+        "return_id": return_id,
+        "request": request,
+        "request_sha256": _fingerprint(request),
+        "inventory_revision": state["revision"],
+        "finished_revision": state["finished_revision"],
+        "result": result,
+    }
+    state["return_order"].append(return_id)
+    return result
+
+
+def register_return(workspace_dir, source_path, output_path=None):
+    data = load(source_path)
+    return_id, expected_inventory, expected_finished, items = validate_return(data)
+    request = _canonical_return_request(
+        return_id, expected_inventory, expected_finished, items)
+    with _locked(workspace_dir):
+        state = _read_state(workspace_dir)
+        existing = state["returns"].get(return_id)
+        if existing is not None:
+            # Idempotency wins over revision checks and the current lifecycle
+            # of the original piece or its root, exactly like the other
+            # stable-id commands.
+            if existing["request_sha256"] == _fingerprint(request):
+                result = existing["result"]
+                if output_path is not None and _output_ready(output_path, result):
+                    publish(output_path, result)
+                return result
+            raise ConflictError(
+                f"return_id is already registered with different input: {return_id}")
+        if expected_inventory != state["revision"]:
+            raise ValueError(
+                f"expected_inventory_revision is stale: expected "
+                f"{expected_inventory}, workspace is at revision "
+                f"{state['revision']}")
+        if expected_finished != state["finished_revision"]:
+            raise ValueError(
+                f"expected_finished_revision is stale: expected "
+                f"{expected_finished}, workspace is at finished revision "
+                f"{state['finished_revision']}")
+        result = _build_return(state, data)
+        # A predictable output conflict is rejected before any state is saved.
+        needs_publish = output_path is not None and _output_ready(output_path, result)
+        _write_state(workspace_dir, state)
+    if needs_publish:
+        publish(output_path, result)
+    return result
+
+
+def _return_item_current(state, item):
+    """Current lifecycle of one rework identity, shown beside the frozen receipt."""
+    entry = state["entries"].get(item["return_entry_id"])
+    covered = _active_root_incidents(state)
+    incidents = list(covered.get(item["root_stock_id"], ()))
+    if entry is None:
+        status = "unknown"
+        consumed_by = None
+    elif entry["status"] == "consumed":
+        status = "consumed"
+        consumed_by = entry["consumed_by"]
+    else:
+        status = "isolated" if incidents else "available"
+        consumed_by = None
+    inspection = current_inspection(state, item["return_entry_id"])
+    return {
+        "dispatch_id": item["dispatch_id"],
+        "kit_id": item["kit_id"],
+        "slot_id": item["slot_id"],
+        "piece": dict(item["piece"]),
+        "return_entry_id": item["return_entry_id"],
+        "root_stock_id": item["root_stock_id"],
+        "length_mm": item["length_mm"],
+        "root_start_mm": item["root_start_mm"],
+        "root_end_mm": item["root_end_mm"],
+        "current_status": status,
+        "consumed_by_job": consumed_by,
+        "active_incidents": incidents,
+        "current_inspection_id": inspection["inspection_id"] if inspection else None,
+        "current_reject_zones": inspection["reject_zones"] if inspection else [],
+    }
+
+
+def return_status(workspace_dir, return_id=None):
+    with _locked(workspace_dir, exclusive=False):
+        state = _read_state(workspace_dir)
+        if return_id is not None:
+            record = state["returns"].get(return_id)
+            if record is None:
+                raise ValueError(f"unknown return_id: {return_id}")
+            result = json.loads(_canonical(record["result"]))
+            result["kind"] = "stock-workspace-return-status"
+            result["current"] = [
+                _return_item_current(state, item) for item in record["result"]["items"]]
+            return result
+        return {
+            "schema_version": SCHEMA,
+            "kind": "stock-workspace-return-list",
+            "workspace_id": state["workspace_id"],
+            "revision": state["revision"],
+            "finished_revision": state["finished_revision"],
+            "returns": [
+                {"return_id": key,
+                 "inventory_revision": state["returns"][key]["inventory_revision"],
+                 "finished_revision": state["returns"][key]["finished_revision"],
+                 "items": len(state["returns"][key]["result"]["items"])}
+                for key in state.get("return_order", ())],
+            "summary": {"returns": len(state.get("return_order", ())),
+                        "returned_pieces": sum(
+                            len(state["returns"][key]["result"]["items"])
+                            for key in state.get("return_order", ()))},
         }
 
 

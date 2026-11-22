@@ -114,6 +114,60 @@ def validate_inspection(data):
     return inspection_id, entry_id, expected, zones
 
 
+def validate_piece_ref(row, label="piece"):
+    """The shared four-field physical piece reference object."""
+    if not isinstance(row, dict):
+        raise ValueError(f"{label} must be an object")
+    return {
+        "job_id": text(row["job_id"], f"{label}.job_id"),
+        "entry_id": text(row["entry_id"], f"{label}.entry_id"),
+        "order_id": text(row["order_id"], f"{label}.order_id"),
+        "unit": integer(row["unit"], f"{label}.unit", 1),
+    }
+
+
+def validate_return(data):
+    """Customer return registration: shape and intra-request uniqueness only.
+
+    Existence, delivery occupation and revision checks need workspace state and
+    live in ``workspace.py``. Returns the canonical ``(return_id, expected
+    inventory revision, expected finished revision, items)``; item order carries
+    no meaning and is normalized by the caller into the canonical request.
+    """
+    return_id = text(data.get("return_id"), "return_id")
+    expected_inventory = integer(data.get("expected_inventory_revision"),
+                                 "expected_inventory_revision")
+    expected_finished = integer(data.get("expected_finished_revision"),
+                                "expected_finished_revision")
+    raw_items = data.get("items")
+    if not isinstance(raw_items, list):
+        raise ValueError("items must be an array")
+    if not 1 <= len(raw_items) <= 32:
+        raise ValueError("require 1..32 return items")
+    items = []
+    slots = set()
+    pieces = set()
+    for row in raw_items:
+        if not isinstance(row, dict):
+            raise ValueError("items rows must be objects")
+        dispatch_id = text(row.get("dispatch_id"), "dispatch_id")
+        kit_id = text(row.get("kit_id"), "kit_id")
+        slot_id = text(row.get("slot_id"), "slot_id")
+        slot_key = (dispatch_id, kit_id, slot_id)
+        if slot_key in slots:
+            raise ValueError(f"duplicate slot in return request: {slot_key}")
+        slots.add(slot_key)
+        piece = validate_piece_ref(row.get("piece"))
+        piece_key = (piece["job_id"], piece["entry_id"],
+                     piece["order_id"], piece["unit"])
+        if piece_key in pieces:
+            raise ValueError(f"duplicate piece in return request: {piece}")
+        pieces.add(piece_key)
+        items.append({"dispatch_id": dispatch_id, "kit_id": kit_id,
+                      "slot_id": slot_id, "piece": piece})
+    return return_id, expected_inventory, expected_finished, items
+
+
 def validate_salvage(data):
     """Salvage request: batch fields plus a bounded candidate entry list."""
     job_id, orders = validate_batch(data)

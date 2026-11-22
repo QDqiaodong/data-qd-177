@@ -809,6 +809,25 @@ class PhysicalLedgerTests(SalvageCase):
             self.assertEqual(row["root_start_mm"],
                              stored_offset + row["start_mm"])
 
+    def test_lane_root_coordinates_on_a_non_root_candidate(self):
+        # A descendant candidate whose local zero sits inside the root must
+        # report root coordinates, not its local coordinates, on every lane.
+        self.init([stock_row("R1", 100, head=4, tail=0)])
+        first = self.normal_commit(batch("b1", [order("rail", 30)],
+                                         kerf=2, min_offcut=5))
+        legacy_id = first["added_entries"][0]["entry_id"]
+        state = read_state(self.ws)
+        offset = workspace.root_offset_of(state, legacy_id)
+        self.assertEqual(offset, 36)
+        self.inspect("INS-1", legacy_id, [zone(10, 13)])
+        plan = self.salvage_plan(salvage_request(
+            "sv1", [legacy_id], [order("pin", 8)], kerf=1, min_offcut=4))
+        candidate = next(c for c in plan["candidates"]
+                         if c["entry_id"] == legacy_id)
+        for lane in candidate["lanes"]:
+            self.assertEqual(lane["root_start_mm"], offset + lane["start_mm"])
+            self.assertEqual(lane["root_end_mm"], offset + lane["end_mm"])
+
     def test_multiple_offcuts_get_distinct_stable_identities(self):
         self.init([stock_row("R1", 60)])
         self.inspect("INS-1", "stock/R1", [zone(20, 22), zone(40, 42)])

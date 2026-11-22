@@ -323,7 +323,7 @@ def solve(eligible, kits):
 
 
 def build_plan(workspace_id, finished_revision, catalog, delivered_by,
-               covered_roots, data):
+               covered_roots, data, returned_by=None):
     """Pure delivery preview against one consistent workspace snapshot.
 
     ``catalog`` maps committed piece references to their facts,
@@ -331,7 +331,11 @@ def build_plan(workspace_id, finished_revision, catalog, delivered_by,
     dispatch id, and ``covered_roots`` maps stock roots to their active
     quality incident ids. Unknown candidate references fail; known but
     occupied or isolated candidates are listed as excluded, never allocated.
+    A returned piece keeps its original delivery occupation forever, so it is
+    excluded as delivered; ``returned_by`` additionally names the return
+    receipt and rework identity when a candidate has already come back.
     """
+    returned_by = returned_by or {}
     dispatch_id, candidates, kits = validate(data)
     request = normalize_request(dispatch_id, candidates, kits)
     excluded = []
@@ -342,6 +346,7 @@ def build_plan(workspace_id, finished_revision, catalog, delivered_by,
         if facts is None:
             raise ValueError(f"unknown candidate piece: {candidate}")
         owner = delivered_by.get(ref)
+        return_id = returned_by.get(ref)
         incidents = list(covered_roots.get(facts["root_stock_id"], ()))
         reasons = []
         if owner is not None:
@@ -349,8 +354,13 @@ def build_plan(workspace_id, finished_revision, catalog, delivered_by,
         if incidents:
             reasons.append("isolated")
         if reasons:
-            excluded.append({"piece": dict(candidate), "reasons": reasons,
-                             "delivered_by": owner, "active_incidents": incidents})
+            row = {"piece": dict(candidate), "reasons": reasons,
+                   "delivered_by": owner, "active_incidents": incidents}
+            # The return fact is an extra dimension shown only when it exists,
+            # so exclusion rows without a return keep their original shape.
+            if return_id is not None:
+                row["returned_by"] = return_id
+            excluded.append(row)
         else:
             eligible.append(dict(facts))
     eligible.sort(key=_ref)

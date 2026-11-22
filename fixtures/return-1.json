@@ -1,0 +1,18 @@
+{
+  "return_id": "RT-2026-01",
+  "expected_inventory_revision": 2,
+  "expected_finished_revision": 3,
+  "items": [
+    {
+      "dispatch_id": "DSP-2026-01",
+      "kit_id": "KIT-B",
+      "slot_id": "panel",
+      "piece": {
+        "job_id": "batch-2",
+        "entry_id": "offcut/batch-1/stock/S1",
+        "order_id": "slat",
+        "unit": 1
+      }
+    }
+  ]
+}
